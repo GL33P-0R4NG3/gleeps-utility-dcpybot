@@ -1,0 +1,10 @@
+[project]
+name = "gleeps-utility-dcpybot"
+version = "0.1.0"
+description = "A Discord.py bot full of utility features that I mostly use."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "discord-py[voice]>=2.6.4",
+    "python-dotenv>=1.2.1",
+]
