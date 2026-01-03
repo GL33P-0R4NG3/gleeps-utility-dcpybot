@@ -1,6 +1,6 @@
 # utility_bot.py
-import json
 import os
+from random import randint
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not TOKEN:
@@ -61,6 +61,7 @@ async def send_temporary(
     # Return the message in case the caller wants to do something else with it
     return msg
 
+# TODO: fix the command and make them all in the slash commands too
 # ----------------------------------------------------------------------
 #  COMMAND – let admins change the lobby channel
 # ----------------------------------------------------------------------
@@ -92,14 +93,23 @@ async def handle_lobby_update(
     if not lobby:
         return  # they joined some other channel
 
-    member_voice_count = await DB.get_count_voice_channel_by_member(guild_id, member.id)
-    print(f"DEBUG: Lobby: {lobby}")
+    member_voice_count = await DB.get_count_voice_channel_by_member(guild_id, member.id, after.channel.id)
+    print(f"DEBUG: {member_voice_count} - Lobby:{lobby}")
     if member_voice_count < lobby['settings_json']['MaxVoiceChannels']:
         try:
+            vc_name = str(lobby['settings_json']['NameDefaults']['general'])
+            if vc_name.find("%num%") != -1:
+                num = await DB.get_count_voice_channels(guild_id, lobby['channel_id'])
+                vc_name = vc_name.replace("%num%", str(num))
+
+            vc_name = vc_name.replace("%randnum%", str(randint(0, 1000)))
+
+            print(f"DEBUG: {vc_name}")
             new_vc = await after.channel.guild.create_voice_channel(
-                name=f"{lobby['settings_json']['NameDefaults']['general']} {await DB.get_count_voice_channels(guild_id)}",
+                name=vc_name,
                 category=after.channel.category,
-                reason=f"User {member.id} requested new channel"
+                reason=f"User {member.id} requested new channel",
+                bitrate=int(after.channel.guild.bitrate_limit)
             )
 
             print(f"Voice channel created {new_vc.id}")
@@ -109,6 +119,7 @@ async def handle_lobby_update(
             await DB.set_voice_channel(
                 channel_id=new_vc.id,
                 guild_id=guild_id,
+                lobby_id=lobby['channel_id'],
                 owner_id=member.id
             )
 
@@ -124,6 +135,11 @@ async def handle_lobby_update(
                 return
 
         print("Creating voice channel completed")
+    else:
+        await after.channel.send(
+            content=f"{member.mention}\nYou already reached the maximum created channels ({lobby['settings_json']['MaxVoiceChannels']}) for this Lobby. Please use one of your created channels or contact admin if there is a issue.",
+            delete_after=60
+        )
 
 async def handle_voice_leave(member: discord.Member, before: discord.VoiceState):
     guild_id = before.channel.guild.id
@@ -164,6 +180,7 @@ async def on_voice_state_update(
 
     # await start_questionnaire(after, member)
 
+# TODO: make the questionnaire better and functional
 # ----------------------------------------------------------------------
 #  QUESTIONNAIRE – UI that asks for Type & (optionally) game name
 # ----------------------------------------------------------------------
@@ -427,8 +444,8 @@ class _ChannelControlView(discord.ui.View):
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def _prune_expired():
     """Runs every 5min, deletes DB rows & Discord channels that have expired."""
-    print("DEBUG: running prune_expired task")
-    async for guild_id, channel_id, last_dc_time, settings in DB.iterate_voice_rows():
+    # print("DEBUG: running prune_expired task")
+    async for guild_id, channel_id, lobby_id, last_dc_time, settings in DB.iterate_voice_rows():
         guild = BOT.get_guild(guild_id)
         channel = guild.get_channel(channel_id)
 

@@ -26,7 +26,7 @@ class DBHelper:
                 );
 
                 CREATE TABLE IF NOT EXISTS users (
-                    uid           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    u_id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id       INTEGER NOT NULL,
                     guild_id      INTEGER NOT NULL,
                     settings_json TEXT NOT NULL DEFAULT '{}',
@@ -38,17 +38,19 @@ class DBHelper:
                     vc_id           INTEGER PRIMARY KEY AUTOINCREMENT,
                     channel_id      INTEGER NOT NULL,
                     guild_id        INTEGER NOT NULL,
+                    lobby_id        INTEGER NOT NULL,
                     owner_id        INTEGER NOT NULL,
                     private         BOOL NOT NULL DEFAULT FALSE,
                     purpose         TEXT,
                     channel_name    TEXT NOT NULL DEFAULT 'general',
                     last_dc_time    INTEGER,
                     settings_json   TEXT NOT NULL DEFAULT '{}',
-                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE,
+                    FOREIGN KEY (lobby_id) REFERENCES lobbies(channel_id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS lobbies (
-                    lobby_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    l_id           INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id       INTEGER NOT NULL,
                     channel_id     INTEGER NOT NULL,
                     settings_json  TEXT NOT NULL DEFAULT '{}',
@@ -135,9 +137,10 @@ class DBHelper:
     #  VOICE‑CHANNEL helpers
     # -------------------------------------------------------------------------------
     async def set_voice_channel(
-        self,
+            self, *,
             channel_id: int,
             guild_id: int,
+            lobby_id: int,
             owner_id: int,
             purpose: Optional[str] = None,
             channel_name: str = "general",
@@ -154,13 +157,14 @@ class DBHelper:
             cursor = await db.execute(
                 """
                 INSERT INTO voice_channels
-                (channel_id, guild_id, owner_id, private, purpose,
+                (channel_id, guild_id, lobby_id, owner_id, private, purpose,
                  channel_name, settings_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     channel_id,
                     guild_id,
+                    lobby_id,
                     owner_id,
                     int(private),
                     purpose,
@@ -193,7 +197,7 @@ class DBHelper:
                 data["settings_json"] = json.loads(data.pop("settings_json") or "{}")
                 return data
 
-    async def get_count_voice_channel_by_member(self, guild_id: int, member_id: int) -> int:
+    async def get_count_voice_channel_by_member(self, guild_id: int, member_id: int, lobby_id: int) -> int:
         """Fetch a voice‑channel row by its Discord ``channel_id``."""
         async with aiosqlite.connect(self.path) as db:
             async with db.execute(
@@ -201,15 +205,17 @@ class DBHelper:
                 SELECT COUNT(vc_id) FROM voice_channels
                 WHERE owner_id = ?
                 AND guild_id = ?
+                AND lobby_id = ?
                 """,
-                (member_id, guild_id),
+                (member_id, guild_id, lobby_id),
             ) as cur:
                 row = await cur.fetchone()
                 return row[0]
 
-    async def get_count_voice_channels(self, guild_id: int) -> int:
+    async def get_count_voice_channels(self, guild_id: int, lobby_id: int) -> int:
         """
         :param guild_id:
+        :param lobby_id:
         :return: The number of active voice channels in given guild.
         """
         async with aiosqlite.connect(self.path) as db:
@@ -217,8 +223,9 @@ class DBHelper:
                 """
                 SELECT COUNT(vc_id) FROM voice_channels
                 WHERE guild_id = ?
+                AND lobby_id = ?
                 """,
-                (guild_id,)
+                (guild_id, lobby_id)
             ) as cur:
                 row = await cur.fetchone()
                 return row[0]
@@ -261,7 +268,7 @@ class DBHelper:
 
     async def iterate_voice_rows(self) -> AsyncGenerator[Tuple[int, int, int, Dict[str, Any]], None]:
         """
-        Async generator that yields (guild_id, channel_id, last_dc_time, settings_json) for every voice‑channel.
+        Async generator that yields (guild_id, channel_id, lobby_id, last_dc_time, settings_json) for every voice‑channel.
 
         The generator opens a cursor **once** and streams rows one at a time,
         so the DB can be updated while we are iterating.
@@ -270,13 +277,13 @@ class DBHelper:
             # Use a *forward‑only* cursor – we never need random access.
             async with conn.execute(
                     """
-                    SELECT guild_id, channel_id, last_dc_time, settings_json
+                    SELECT guild_id, channel_id, lobby_id, last_dc_time, settings_json
                     FROM voice_channels
                     """,
                     (),
             ) as cur:
                 async for row in cur:  # yields each row as a tuple
-                    yield row  # (guild_id, channel_id, last_dc_time, settings_json)
+                    yield row  # (guild_id, channel_id, lobby_id, last_dc_time, settings_json)
 
     async def check_voice_expiration(self) -> Dict[str, Any]:
         """
@@ -335,7 +342,7 @@ class DBHelper:
         async with aiosqlite.connect(self.path) as db:
             async with db.execute(
                 """
-                SELECT lobby_id, settings_json
+                SELECT l_id, settings_json
                 FROM lobbies
                 WHERE guild_id = ? AND channel_id = ?
                 """,
@@ -344,9 +351,9 @@ class DBHelper:
                 row = await cur.fetchone()
                 if not row:
                     return None
-                lobby_id, settings_json = row
+                l_id, settings_json = row
                 return {
-                    "lobby_id": lobby_id,
+                    "l_id": l_id,
                     "guild_id": guild_id,
                     "channel_id": channel_id,
                     "settings_json": json.loads(settings_json or "{}"),
