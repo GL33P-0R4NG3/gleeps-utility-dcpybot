@@ -1,12 +1,19 @@
-# bot.py
+# utility_bot.py
+import json
+import os
+
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_BOT_TOKEN not set – check your .env file")
+
 # ------------------------------------------------------------
 #  Imports & global objects
 # ------------------------------------------------------------
 import discord
 from discord.ext import commands, tasks
-import asyncio
 import time
-from typing import Optional, Dict, Any, List
+import asyncio
+from typing import Optional, Dict
 
 from data.db_helper import DBHelper          # <-- Custom database helper
 
@@ -15,18 +22,44 @@ from data.db_helper import DBHelper          # <-- Custom database helper
 # ----------------------------------------------------------------------
 INTENTS = discord.Intents.all()
 
-BOT = commands.Bot(command_prefix="!glup", intents=INTENTS)
+BOT = commands.Bot(command_prefix="g!", intents=INTENTS)
 DB  = DBHelper()                     # singleton for the whole process
 
 # ----------------------------------------------------------------------
-#  Configuration helpers
+#  Constants & Functions
 # ----------------------------------------------------------------------
-DEFAULT_LOBBY_ID = 123456789012345678   # ← replace with a fallback ID
+CHECK_INTERVAL = 2 * 60   # seconds
 
-#async def get_lobby_id(guild_id: int) -> int:
-#    """Return the lobby channel ID for a guild (fallback → DEFAULT_LOBBY_ID)."""
-#    settings = await DB.get_guild_settings(guild_id)
-#    return settings.get("lobby_channel_id", DEFAULT_LOBBY_ID)
+async def send_temporary(
+    channel: discord.abc.Messageable,
+    content: str,
+    *,
+    delete_after: float = 120.0,   # seconds (2min by default)
+    **send_kwargs,
+) -> discord.Message:
+    """
+    Sends a message to ``channel`` and schedules it for deletion after
+    ``delete_after`` seconds.
+
+    Returns the sent :class:discord.Message so you can still interact with it
+    (edit, add reactions, etc.) before it disappears.
+    """
+    msg = await channel.send(content, **send_kwargs)
+
+    # Define a tiny coroutine that waits then deletes the message
+    async def _deleter(message: discord.Message, delay: float):
+        try:
+            await asyncio.sleep(delay)
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden):
+            # Message already gone or we lack perms – just ignore
+            pass
+
+    # Schedule the deleter as a background task (no awaiting here)
+    asyncio.create_task(_deleter(msg, delete_after))
+
+    # Return the message in case the caller wants to do something else with it
+    return msg
 
 # ----------------------------------------------------------------------
 #  COMMAND – let admins change the lobby channel
@@ -35,13 +68,78 @@ DEFAULT_LOBBY_ID = 123456789012345678   # ← replace with a fallback ID
 @commands.has_permissions(manage_guild=True)
 async def set_lobby(ctx: commands.Context, channel: discord.VoiceChannel):
     """Save a new lobby channel ID in the guild‑wide settings JSON."""
-    await DB.set_guild_settings(ctx.guild.id, {"lobby_channel_id": channel.id})
-    await ctx.send(f"✅ Lobby channel set to **{channel.name}**", ephemeral=True)
+    guild_id = ctx.guild.id
+    print(f"DEBUG: channel {channel.id} guild {guild_id}")
+    a = await DB.get_lobby(guild_id, channel.id)
+    print(f"{a}")
+    if a is not None:
+        await ctx.reply(f"❌ **{channel.name}** is already a lobby channel.")
+        return
+
+    await DB.set_lobby(guild_id, channel.id, await DB.get_settings_guild(guild_id))
+    await ctx.reply(f"✅ New lobby channel linked **{channel.name}**", ephemeral=True)
 
 
 # ----------------------------------------------------------------------
 #  EVENT – voice state updates (join detection)
 # ----------------------------------------------------------------------
+async def handle_lobby_update(
+        member: discord.Member,
+        after: discord.VoiceState
+):
+    guild_id = after.channel.guild.id
+    lobby = await DB.get_lobby(guild_id, after.channel.id)
+    if not lobby:
+        return  # they joined some other channel
+
+    member_voice_count = await DB.get_count_voice_channel_by_member(guild_id, member.id)
+    print(f"DEBUG: Lobby: {lobby}")
+    if member_voice_count < lobby['settings_json']['MaxVoiceChannels']:
+        try:
+            new_vc = await after.channel.guild.create_voice_channel(
+                name=f"{lobby['settings_json']['NameDefaults']['general']} {await DB.get_count_voice_channels(guild_id)}",
+                category=after.channel.category,
+                reason=f"User {member.id} requested new channel"
+            )
+
+            print(f"Voice channel created {new_vc.id}")
+
+            await member.move_to(channel=new_vc, reason="Moving to the new requested channel")
+
+            await DB.set_voice_channel(
+                channel_id=new_vc.id,
+                guild_id=guild_id,
+                owner_id=member.id
+            )
+
+        except discord.HTTPException:
+            print(f"Could not create voice channel for member {member.id}. Notifying member through DM")
+            try:
+                dm = await member.create_dm()
+                await dm.send(
+                    content="Sorry we are having some issues with creating voice channels please try reconnecting or try again later.",
+                    delete_after=120
+                )
+            finally:
+                return
+
+        print("Creating voice channel completed")
+
+async def handle_voice_leave(member: discord.Member, before: discord.VoiceState):
+    guild_id = before.channel.guild.id
+    chan = await DB.get_voice_channel(guild_id, before.channel.id)
+    print(f"DEBUG: handle_voice_leave {chan}")
+    if chan is None:
+        return
+
+    if len(before.channel.voice_states) > 0:
+        return              # if there is still someone in the channel
+
+    await DB.update_voice_last_disconnect(guild_id, before.channel.id, int(time.time()) + (5 * 60))
+
+    print(f"DEBUG: Updated last_disconnect on {before.channel.name}")
+
+
 @BOT.event
 async def on_voice_state_update(
     member: discord.Member,
@@ -55,35 +153,30 @@ async def on_voice_state_update(
     if member.bot:
         return                      # ignore bots
 
-    if after.channel is None:
-        return                      # user left a channel – nothing to do
-
     if before.channel == after.channel:
         return
 
+    if after.channel is not None:
+        await handle_lobby_update(member, after)
 
-    lobby = await DB.get_lobby(after.channel.guild.id, after.channel.id)
-    if not lobby:
-        return                      # they joined some other channel
+    if before.channel is not None:
+        await handle_voice_leave(member, before)
 
-
-    await _start_questionnaire(after, member)
-
+    # await start_questionnaire(after, member)
 
 # ----------------------------------------------------------------------
 #  QUESTIONNAIRE – UI that asks for Type & (optionally) game name
 # ----------------------------------------------------------------------
-async def _start_questionnaire(voice_state: discord.VoiceState, member: discord.Member) -> None:
+async def start_questionnaire(voice_state: discord.VoiceState, member: discord.Member) -> None:
     """
-    Sends the interactive UI (Select → optional Modal) to *target*.
-    If *target* is None we DM the member.
+    Sends the interactive UI (Select → optional Modal) to member.
     """
 
 
     view = _TypeSelectView(member)
     await voice_state.channel.send(
         "👋 Hi! I’m going to set up a voice channel for you.\n"
-        "Please choose the type of room you’d like:",
+        "Please choose the type of room you’d like.",
         view=view,
     )
 
@@ -103,16 +196,16 @@ class _TypeSelect(discord.ui.Select):
             discord.SelectOption(
                 label="Gaming room",
                 value="gaming",
-                description="A room for playing a game together",
+                description="A room for playing a games together",
             ),
             discord.SelectOption(
-                label="General chat room",
+                label="General room",
                 value="general",
-                description="Just a regular voice hangout",
+                description="Regular voice channel without any changes",
             ),
         ]
         super().__init__(
-            placeholder="What kind of temporary room do you need?",
+            placeholder="What kind of game you want?",
             min_values=1,
             max_values=1,
             options=options,
@@ -122,13 +215,13 @@ class _TypeSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         # Only the user who started the flow may interact
         if interaction.user.id != self.author.id:
-            await interaction.response.send_message(
+            await interaction.followup.send_message(
                 "❌ This menu isn’t for you.", ephemeral=True
             )
             return
 
         type_purpose = self.values[0]
-        await interaction.response.defer()
+        await interaction.followup.defer()
 
         if type_purpose == "gaming":
             await interaction.followup.send_modal(_GameNameModal(self.author, type_purpose))
@@ -156,7 +249,7 @@ class _GameNameModal(discord.ui.Modal, title="Game selection"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
-            await interaction.response.send_message(
+            await interaction.followup.send_message(
                 "❌ Not your modal.", ephemeral=True
             )
             return
@@ -211,7 +304,7 @@ async def _create_temp_room(
     )
 
     # ----- Store metadata ---------------------------
-    await DB.add_voice_channel(
+    await DB.set_voice_channel(
         channel_id=new_vc.id,
         guild_id=guild.id,
         owner_id=author.id,
@@ -331,10 +424,35 @@ class _ChannelControlView(discord.ui.View):
 # ----------------------------------------------------------------------
 #  PERIODIC CLEANUP – remove expired temporary channels
 # ----------------------------------------------------------------------
-@tasks.loop(minutes=5)
+@tasks.loop(seconds=CHECK_INTERVAL)
 async def _prune_expired():
     """Runs every 5min, deletes DB rows & Discord channels that have expired."""
-    DB.
+    print("DEBUG: running prune_expired task")
+    async for guild_id, channel_id, last_dc_time, settings in DB.iterate_voice_rows():
+        guild = BOT.get_guild(guild_id)
+        channel = guild.get_channel(channel_id)
+
+        if last_dc_time is None:
+            # print(f"DEBUG: Nothing to do")
+            continue
+
+        if len(channel.voice_states) > 0:
+            # await DB.update_voice_last_disconnect(guild_id, channel_id)
+            print(f"DEBUG: Members are still in channel {channel.name} skipping...")
+            continue
+
+        if last_dc_time > int(time.time()):
+            print(f"DEBUG: Channel {channel.name} did not reach its expiry yet, skipping...")
+            continue
+
+        try:
+            await channel.delete(reason="Auto-deleting channel due to long inactivity")
+        except discord.HTTPException as e:
+            print(f"Error while deleting channel {channel.name} on guild {guild.name}: {e}")
+        finally:
+            await DB.delete_voice_channel(guild_id, channel_id)
+            print(f"Deleted channel {channel.name} on guild {guild.name} due to inactivity")
+
 
 
 @BOT.event

@@ -2,7 +2,7 @@
 import aiosqlite
 import json
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, AsyncGenerator, Tuple
 
 
 class DBHelper:
@@ -62,7 +62,7 @@ class DBHelper:
     # -------------------------------------------------------------------------------
     #  GUILD helpers
     # -------------------------------------------------------------------------------
-    async def get_guild_settings(self, guild_id: int) -> Dict[str, Any]:
+    async def get_settings_guild(self, guild_id: int) -> Dict[str, Any]:
         """Return the JSON dict stored in guilds.settings_json. Creates row if missing."""
         async with aiosqlite.connect(self.path) as db:
             async with db.execute(
@@ -77,25 +77,26 @@ class DBHelper:
                 await db.commit()
                 return {}
 
-    async def set_guild_settings(self, guild_id: int, settings: Dict[str, Any]) -> None:
+    async def set_settings_guild(self, guild_id: int, settings: Dict[str, Any]) -> None:
         """
         Replace the whole ``settings_json`` for a guild with the supplied dict.
         """
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 """
-                UPDATE guilds
-                SET settings_json = ?
-                WHERE guild_id = ?
+                INSERT INTO guilds (guild_id, settings_json)
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE
+                SET settings_json = excluded.settings_json
                 """,
-                (json.dumps(settings), guild_id),
+                (guild_id, json.dumps(settings)),
             )
             await db.commit()
 
     # -------------------------------------------------------------------------------
     #  USER helpers (note: uid is auto‑generated, we work with user_id and guild_id)
     # -------------------------------------------------------------------------------
-    async def get_user_settings(self, guild_id: int, user_id: int) -> None | Dict[str, Any]:
+    async def get_settings_user(self, guild_id: int, user_id: int) -> None | Dict[str, Any]:
         """Fetch settings_json for a (user_id, guild_id) pair. Returns None if missing."""
         async with aiosqlite.connect(self.path) as db:
             async with db.execute(
@@ -111,7 +112,7 @@ class DBHelper:
 
                 return None
 
-    async def set_user_settings(
+    async def set_settings_user(
             self, guild_id: int, user_id: int, settings: Dict[str, Any]
     ) -> None:
         """
@@ -133,15 +134,15 @@ class DBHelper:
     # -------------------------------------------------------------------------------
     #  VOICE‑CHANNEL helpers
     # -------------------------------------------------------------------------------
-    async def add_voice_channel(
+    async def set_voice_channel(
         self,
-        channel_id: int,
-        guild_id: int,
-        owner_id: int,
-        purpose: Optional[str] = None,
-        channel_name: str = "general",
-        private: bool = False,
-        extra: Optional[Dict[str, Any]] = None,
+            channel_id: int,
+            guild_id: int,
+            owner_id: int,
+            purpose: Optional[str] = None,
+            channel_name: str = "general",
+            private: bool = False,
+            extra: Optional[Dict[str, Any]] = None,
     ) -> int:
         """
         Insert a new temporary voice‑channel row.
@@ -189,8 +190,38 @@ class DBHelper:
                 cols = [d[0] for d in cur.description]
                 data = dict(zip(cols, row))
                 # Decode the JSON payload
-                data["settings"] = json.loads(data.pop("settings_json") or "{}")
+                data["settings_json"] = json.loads(data.pop("settings_json") or "{}")
                 return data
+
+    async def get_count_voice_channel_by_member(self, guild_id: int, member_id: int) -> int:
+        """Fetch a voice‑channel row by its Discord ``channel_id``."""
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                """
+                SELECT COUNT(vc_id) FROM voice_channels
+                WHERE owner_id = ?
+                AND guild_id = ?
+                """,
+                (member_id, guild_id),
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0]
+
+    async def get_count_voice_channels(self, guild_id: int) -> int:
+        """
+        :param guild_id:
+        :return: The number of active voice channels in given guild.
+        """
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                """
+                SELECT COUNT(vc_id) FROM voice_channels
+                WHERE guild_id = ?
+                """,
+                (guild_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0]
 
     async def set_voice_channel_settings(
         self, channel_id: int, settings: Dict[str, Any]
@@ -209,8 +240,6 @@ class DBHelper:
             )
             await db.commit()
 
-    
-
     async def update_voice_last_disconnect(
         self, guild_id: int, channel_id: int, timestamp: Optional[int] = None
     ) -> None:
@@ -218,7 +247,6 @@ class DBHelper:
         Update the ``last_dc_time`` column (used for expiry or “when did it close”).
         If ``timestamp`` is omitted the current epoch seconds are used.
         """
-        ts = timestamp if timestamp is not None else int(time.time())
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 """
@@ -227,20 +255,44 @@ class DBHelper:
                 WHERE channel_id = ?
                 AND guild_id = ?
                 """,
-                (ts, channel_id, guild_id),
+                (timestamp, channel_id, guild_id),
             )
             await db.commit()
 
-    # -------------------------------------------------------------------------------
-    #  Delete a **single** voice‑channel row (by guild_id + channel_id)
-    # -------------------------------------------------------------------------------
+    async def iterate_voice_rows(self) -> AsyncGenerator[Tuple[int, int, int, Dict[str, Any]], None]:
+        """
+        Async generator that yields (guild_id, channel_id, last_dc_time, settings_json) for every voice‑channel.
+
+        The generator opens a cursor **once** and streams rows one at a time,
+        so the DB can be updated while we are iterating.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            # Use a *forward‑only* cursor – we never need random access.
+            async with conn.execute(
+                    """
+                    SELECT guild_id, channel_id, last_dc_time, settings_json
+                    FROM voice_channels
+                    """,
+                    (),
+            ) as cur:
+                async for row in cur:  # yields each row as a tuple
+                    yield row  # (guild_id, channel_id, last_dc_time, settings_json)
+
+    async def check_voice_expiration(self) -> Dict[str, Any]:
+        """
+        Checks expirations of ALL voice channels on every guild this bot is on
+        and deletes all expired voice channels.
+
+        :return: Dict with KV pair of deleted guilds (K) and channels (V).
+        """
+
     async def delete_voice_channel(self, guild_id: int, channel_id: int) -> None:
         """
         Remove ONE voice‑channel entry identified by the (guild_id, channel_id)
         pair.
         """
         async with aiosqlite.connect(self.path) as db:
-            cursor = await db.execute(
+            await db.execute(
                 """
                 DELETE
                 FROM voice_channels
@@ -254,24 +306,22 @@ class DBHelper:
     # -------------------------------------------------------------------------------
     #  LOBBY helpers (unchanged except for naming consistency)
     # -------------------------------------------------------------------------------
-    async def add_lobby(
+    async def set_lobby(
         self,
         guild_id: int,
         channel_id: int,
-        extra: Optional[Dict[str, Any]] = None,
+        settings_json: Optional[Dict[str, Any]] = None,
     ) -> int:
         """
-        Insert (or replace) a lobby for a given channel.
+        Insert a lobby for a given channel.
         Returns the autogenerated ``lobby_id``.
         """
-        settings = json.dumps(extra or {})
+        settings = json.dumps(settings_json or {})
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
                 """
                 INSERT INTO lobbies (guild_id, channel_id, settings_json)
                 VALUES (?, ?, ?)
-                ON CONFLICT(guild_id, channel_id) DO UPDATE
-                SET settings_json = excluded.settings_json
                 """,
                 (guild_id, channel_id, settings),
             )
@@ -299,8 +349,20 @@ class DBHelper:
                     "lobby_id": lobby_id,
                     "guild_id": guild_id,
                     "channel_id": channel_id,
-                    "settings": json.loads(settings_json or "{}"),
+                    "settings_json": json.loads(settings_json or "{}"),
                 }
+
+    async def get_settings_lobby(self, guild_id: int, channel_id: int) -> Dict[str, Any]:
+        """Return the JSON dict stored in lobbies.settings_json. Creates row if missing."""
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT settings_json FROM lobbies WHERE guild_id = ?", (guild_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    return json.loads(row[0])
+
+                return {}
 
     async def update_lobby_setting(
         self, guild_id: int, channel_id: int, key: str, value: Any
