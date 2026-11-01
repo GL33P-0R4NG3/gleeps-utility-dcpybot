@@ -7,6 +7,7 @@ from weakref import WeakValueDictionary
 
 import discord
 from discord.ext import commands, tasks
+from lobby_access import may_create_room
 
 log = logging.getLogger(__name__)
 CHECK_INTERVAL = 60
@@ -94,7 +95,7 @@ class VoiceChannels(commands.Cog):
         if lobby is None:
             return
         settings = lobby["settings_json"]
-        if settings.get("RoomMode", "temporary") != "temporary":
+        if settings.get("RoomMode", "temporary") != "temporary" or not may_create_room(member, settings):
             return
         # Refresh missing records before applying the server-wide one-room limit.
         existing = await self.db.get_member_voice_channels(guild.id, member.id)

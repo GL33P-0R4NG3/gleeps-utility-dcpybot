@@ -8,6 +8,7 @@ import discord
 from discord.ext import commands, tasks
 
 from room_permissions import visibility_overwrites
+from lobby_access import apply_lobby_gate, gate_role_id, may_create_room
 from room_help import RoomHelpView, welcome_embed
 from voice_channels import DELETE_DELAY, CHECK_INTERVAL, OWNER_PERMISSIONS
 
@@ -40,6 +41,14 @@ class SemiRooms(commands.Cog):
         if role is not None and role.guild.id != guild.id:
             raise commands.BadArgument("Choose a role from this server.")
         async with self.lock(("owner", guild.id, member.id)):
+            configured = [row for row in await self.db.list_lobbies(guild.id)
+                          if row["settings_json"]["RoomMode"] == "semi"]
+            if source_lobby is not None:
+                selected = next((row for row in configured if row["lobby_id"] == source_lobby.id), None)
+                if selected is not None and not may_create_room(member, selected["settings_json"]):
+                    return None
+            elif configured and not any(may_create_room(member, row["settings_json"]) for row in configured):
+                raise commands.CheckFailure("You need a private-room lobby's creation role before creating a room.")
             for row in await self.db.list_semi_rooms(guild.id):
                 if row["owner_id"] != member.id:
                     continue
@@ -126,7 +135,16 @@ class SemiRooms(commands.Cog):
         if guild.unavailable:
             return
         async with self.lock(("lobbies", guild.id)):
-            lobbies = {row["lobby_id"] for row in await self.db.list_lobbies(guild.id)
+            configured = await self.db.list_lobbies(guild.id)
+            for lobby in configured:
+                try:
+                    await apply_lobby_gate(guild, lobby["lobby_id"], lobby["settings_json"])
+                except discord.NotFound:
+                    pass
+                except Exception:
+                    log.exception("Lobby gate enforcement failed lobby_id=%s", lobby["lobby_id"])
+            settings_by_lobby = {row["lobby_id"]: row["settings_json"] for row in configured}
+            lobbies = {row["lobby_id"] for row in configured
                        if row["settings_json"]["RoomMode"] == "semi"}
             owners = {row["owner_id"] for row in await self.db.list_semi_rooms(guild.id)}
             records = {(row["lobby_id"], row["user_id"]): row
@@ -155,6 +173,9 @@ class SemiRooms(commands.Cog):
                         if overwrite.connect is False:
                             previous = record["previous_connect"]
                             overwrite.connect = None if previous is None else bool(previous)
+                            # Do not restore an old member allow that bypasses a role gate.
+                            if overwrite.connect is True and gate_role_id(settings_by_lobby.get(lobby_id, {})) is not None:
+                                overwrite.connect = None
                             await channel.set_permissions(target, overwrite=None if overwrite.is_empty() else overwrite,
                                                           reason="Private-room lobby restriction released")
                         await self.db.delete_lobby_lock(guild.id, lobby_id, user_id)
@@ -215,12 +236,10 @@ class SemiRooms(commands.Cog):
             try:
                 lobby = await self.db.get_lobby(member.guild.id, after.channel.id)
                 if lobby and lobby["settings_json"].get("RoomMode") == "semi":
-                    role_id = lobby["settings_json"].get("AccessRoleID")
-                    role = member.guild.get_role(role_id) if role_id else None
-                    if role_id and role is None:
-                        raise RuntimeError("Configured lobby access role no longer exists")
+                    if not may_create_room(member, lobby["settings_json"]):
+                        return
                     await self.create_room(member, after.channel.category,
-                                           f"{member.display_name}'s room"[:100], role,
+                                           f"{member.display_name}'s room"[:100],
                                            source_lobby=after.channel)
             except Exception:
                 log.exception("Private lobby creation failed member_id=%s lobby_id=%s", member.id, after.channel.id)

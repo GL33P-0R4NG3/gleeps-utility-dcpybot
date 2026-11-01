@@ -10,6 +10,7 @@ from semi_rooms import SemiRooms
 from room_commands import RoomCommands
 from sql_console import SQLConsole
 from room_help import RoomHelpView
+from lobby_access import apply_lobby_gate
 
 log = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ class AccessRoleConverter(commands.RoleConverter, discord.app_commands.Transform
 @discord.app_commands.choices(mode=[discord.app_commands.Choice(name="Temporary", value="temp"),
                                    discord.app_commands.Choice(name="Semi-temporary", value="semi")])
 @discord.app_commands.describe(mode="Room type", channel="Voice channel members join to create a room",
-                               role="Access role for semi rooms; omit to create one for each room")
+                               role="Who may enter this lobby and create rooms; omit to create a gate role")
 @commands.guild_only()
 @commands.has_guild_permissions(manage_guild=True)
 async def set_lobby(ctx: commands.Context, mode: str, channel: discord.VoiceChannel,
@@ -92,20 +93,20 @@ async def set_lobby(ctx: commands.Context, mode: str, channel: discord.VoiceChan
     mode = {"temp": "temporary", "temporary": "temporary", "semi": "semi"}.get(mode.lower())
     if mode is None:
         raise commands.BadArgument("Choose temp or semi as the lobby type.")
-    if role is not None and mode != "semi":
-        raise commands.BadArgument("Access roles apply to semi lobbies; temporary rooms keep their normal permissions.")
+    if role is None:
+        role = await ctx.guild.create_role(name=f"Create room: {channel.name}"[:100],
+                                           permissions=discord.Permissions.none(),
+                                           reason=f"Lobby gate configured by {ctx.author.id}")
     existing = await ctx.bot.db.get_lobby(ctx.guild.id, channel.id)
     if existing is None:
         settings = await ctx.bot.db.get_settings_guild(ctx.guild.id)
         await ctx.bot.db.set_lobby(ctx.guild.id, channel.id, settings)
     await ctx.bot.db.update_lobby_setting(ctx.guild.id, channel.id, "RoomMode", mode)
-    await ctx.bot.db.update_lobby_setting(ctx.guild.id, channel.id, "AccessRoleID", role.id if role else None)
+    await ctx.bot.db.update_lobby_setting(ctx.guild.id, channel.id, "GateRoleID", role.id)
+    await apply_lobby_gate(ctx.guild, channel.id, {"GateRoleID": role.id})
     await ctx.bot.get_cog("SemiRooms").sync_lobby_locks(ctx.guild)
     log.info("Lobby configured guild_id=%s channel_id=%s mode=%s", ctx.guild.id, channel.id, mode)
-    access = ""
-    if mode == "semi":
-        access = (" Everyone can join created rooms while visible." if role and role.is_default()
-                  else f" Created rooms use {role.mention}." if role
-                  else " A new access role will be created for each room.")
-    await ctx.reply(f"**{channel.name}** is now a {mode} room lobby.{access}",
+    access = ("Everyone may enter this lobby and create a room." if role.is_default()
+              else f"Only members with {role.mention} may enter this lobby and create a room.")
+    await ctx.reply(f"**{channel.name}** is now a {mode} room lobby. {access}",
                     allowed_mentions=discord.AllowedMentions.none())

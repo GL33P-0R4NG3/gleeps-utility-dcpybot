@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source"))
 
@@ -76,6 +76,32 @@ class PermissionTests(unittest.TestCase):
         channel.overwrites[manager].manage_channels = False
         self.assertFalse(can_manage_room(channel, manager, owner.id))
         self.assertFalse(can_manage_room(channel, guest, owner.id))
+
+
+class LobbyGateTests(unittest.TestCase):
+    def test_gate_requires_role_even_for_administrator(self):
+        from lobby_access import may_create_room
+        channel, owner, manager, guest, access = permission_fixture()
+        for member in (owner, guest):
+            member.guild = channel.guild
+        settings = {"GateRoleID": access.id}
+        self.assertTrue(may_create_room(guest, settings))
+        owner.guild_permissions.administrator = True
+        self.assertFalse(may_create_room(owner, settings))
+        self.assertTrue(may_create_room(owner, {"GateRoleID": channel.guild.default_role.id}))
+
+    def test_other_role_and_member_allows_cannot_bypass_gate(self):
+        from lobby_access import lobby_overwrites
+        channel, owner, manager, guest, access = permission_fixture()
+        updated = lobby_overwrites(channel, access)
+        self.assertFalse(updated[channel.guild.default_role].connect)
+        self.assertTrue(updated[access].connect)
+        self.assertIsNone(updated[owner].connect)
+        for role in manager.roles:
+            if role != channel.guild.default_role:
+                self.assertIsNone(updated[role].connect)
+        self.assertFalse(updated[guest].speak)
+
 
 
 class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -180,6 +206,40 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         service = SemiRooms(Mock(), self.db)
         service.set_visibility = AsyncMock()
         return service, guild, member, channel, role
+
+    async def test_private_creation_requires_gate_role_on_lobby_and_command_paths(self):
+        service, guild, member, channel, access = self.semi_creation_fixture()
+        member.roles = []
+        await self.db.update_lobby_setting(1, 2, "RoomMode", "semi")
+        await self.db.update_lobby_setting(1, 2, "GateRoleID", 99)
+        lobby = Mock(id=2)
+        member.voice = SimpleNamespace(channel=lobby)
+        self.assertIsNone(await service.create_room(member, None, "Private room", source_lobby=lobby))
+        with self.assertRaises(commands.CheckFailure):
+            await service.create_room(member, None, "Private room")
+        guild.create_role.assert_not_awaited()
+        guild.create_voice_channel.assert_not_awaited()
+        member.roles = [Mock(id=99)]
+        member.move_to = AsyncMock()
+        await service.create_room(member, None, "Private room", source_lobby=lobby)
+        overwrites = guild.create_voice_channel.await_args.kwargs["overwrites"]
+        self.assertFalse(overwrites[guild.default_role].connect)
+        self.assertNotIn(member.roles[0], overwrites)
+        self.assertTrue(overwrites[member].manage_channels)
+        member.move_to.assert_awaited_once()
+
+    async def test_lobby_event_does_not_pass_gate_role_into_private_room(self):
+        service, guild, member, channel, access = self.semi_creation_fixture()
+        member.roles = [Mock(id=99)]
+        member.bot = False
+        member.display_name = "Owner"
+        await self.db.update_lobby_setting(1, 2, "RoomMode", "semi")
+        await self.db.update_lobby_setting(1, 2, "AccessRoleID", 99)
+        lobby = Mock(id=2)
+        service.create_room = AsyncMock()
+        await service.on_voice_state_update(member, SimpleNamespace(channel=None), SimpleNamespace(channel=lobby))
+        self.assertEqual(len(service.create_room.await_args.args), 3)
+        self.assertNotIn("role", service.create_room.await_args.kwargs)
 
     async def test_semi_lobby_creates_and_moves_owner(self):
         service, guild, member, channel, role = self.semi_creation_fixture()
@@ -434,11 +494,13 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         ctx.bot.get_cog.return_value.sync_lobby_locks = AsyncMock()
         ctx.reply = AsyncMock()
         channel = Mock(id=20)
-        await set_lobby.callback(ctx, "temp", channel)
+        with patch("utility_bot.apply_lobby_gate", new=AsyncMock()):
+            await set_lobby.callback(ctx, "temp", channel, ctx.guild.default_role)
         ctx.bot.db.update_lobby_setting.assert_any_await(ctx.guild.id, 20, "RoomMode", "temporary")
         ctx.guild.default_role.is_default.return_value = True
-        await set_lobby.callback(ctx, "semi", channel, ctx.guild.default_role)
-        ctx.bot.db.update_lobby_setting.assert_any_await(ctx.guild.id, 20, "AccessRoleID", ctx.guild.default_role.id)
+        with patch("utility_bot.apply_lobby_gate", new=AsyncMock()):
+            await set_lobby.callback(ctx, "semi", channel, ctx.guild.default_role)
+        ctx.bot.db.update_lobby_setting.assert_any_await(ctx.guild.id, 20, "GateRoleID", ctx.guild.default_role.id)
 
     async def test_optional_role_parser_allows_name_only(self):
         cog = RoomCommands(Mock())
