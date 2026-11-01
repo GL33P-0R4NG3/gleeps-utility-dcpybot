@@ -31,7 +31,7 @@ def has_manage_channels(channel, member, *, overwrites=None):
     return allowed if personal is None else personal
 
 
-def visibility_overwrites(channel, owner_id, hidden, *, source_overwrites=None):
+def visibility_overwrites(channel, owner_id, hidden, *, source_overwrites=None, opener_ids=()):
     """Change only View Channel; Connect and all other flags are preserved."""
     source = channel.overwrites if source_overwrites is None else source_overwrites
     overwrites = {target: discord.PermissionOverwrite.from_pair(*value.pair())
@@ -39,7 +39,7 @@ def visibility_overwrites(channel, owner_id, hidden, *, source_overwrites=None):
     for target, overwrite in overwrites.items():
         visible = not hidden
         if hidden:
-            if target.id == owner_id or (channel.guild.me is not None and target.id == channel.guild.me.id):
+            if target.id == owner_id or target.id in opener_ids or (channel.guild.me is not None and target.id == channel.guild.me.id):
                 visible = True
             elif isinstance(target, discord.Member):
                 visible = can_manage_room(channel, target, owner_id, overwrites=source)

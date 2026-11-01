@@ -179,25 +179,44 @@ class RoomCommands(commands.Cog):
             members[member.id] = member
         return list(members.values())
 
-    async def update_members(self, ctx, channel, members, *, management, enabled):
-        # Resolve every member before changing anything, then edit all overwrites
-        # in one API operation. The current permissions are rechecked under lock.
+    async def update_members(self, ctx, channel, members, *, management=False, enabled, opener=False):
         service = self.bot.get_cog("SemiRooms")
+        changed, skipped_managers, skipped_others = [], [], []
         async with service.lock(("channel", channel.id)):
             current = await ctx.guild.fetch_channel(channel.id)
             mode, row = await self.managed_room(current, ctx.author)
-            if not enabled and any(member.id == row["owner_id"] for member in members):
+            if not enabled and not opener and any(member.id == row["owner_id"] for member in members):
                 raise commands.BadArgument("The room owner's access and management cannot be revoked with this command.")
+            previous_openers = await self.bot.db.list_room_openers(ctx.guild.id, channel.id)
+            openers = set(previous_openers)
             overwrites = current.overwrites
             for member in members:
+                is_manager = can_manage_room(current, member, row["owner_id"], overwrites=overwrites)
+                if opener and not enabled:
+                    if is_manager:
+                        skipped_managers.append(member)
+                        continue
+                    if member.id not in openers:
+                        skipped_others.append(member)
+                        continue
+                if management and not enabled and not is_manager:
+                    skipped_others.append(member)
+                    continue
                 overwrite = overwrites.setdefault(member, discord.PermissionOverwrite())
                 if management:
                     overwrite.manage_channels = enabled
                     overwrite.connect = True
-                    if enabled:
-                        overwrite.view_channel = True
-                    else:
+                    overwrite.view_channel = True
+                    openers.add(member.id)  # Demoting a manager leaves explicit opener access.
+                    if not enabled:
                         overwrite.manage_permissions = False
+                elif opener:
+                    overwrite.connect = True
+                    overwrite.view_channel = True
+                    if enabled:
+                        openers.add(member.id)
+                    else:
+                        openers.discard(member.id)
                 else:
                     overwrite.connect = enabled
                     if enabled:
@@ -205,13 +224,23 @@ class RoomCommands(commands.Cog):
                     else:
                         overwrite.manage_channels = False
                         overwrite.manage_permissions = False
-            if mode == "semi-temporary":
-                overwrites = visibility_overwrites(current, row["owner_id"], bool(row["hidden"]),
-                                                   source_overwrites=overwrites)
-            await current.edit(overwrites=overwrites, reason=f"Room member permissions updated by {ctx.author.id}")
+                        openers.discard(member.id)
+                changed.append(member)
+            if changed:
+                if mode == "semi-temporary":
+                    overwrites = visibility_overwrites(current, row["owner_id"], bool(row["hidden"]),
+                                                       source_overwrites=overwrites, opener_ids=openers)
+                # Keep persistence and the API edit consistent if Discord rejects it.
+                # Reconciliation uses the same lock and cannot observe this intermediate state.
+                await self.bot.db.replace_room_openers(ctx.guild.id, channel.id, openers)
+                try:
+                    await current.edit(overwrites=overwrites, reason=f"Room member permissions updated by {ctx.author.id}")
+                except Exception:
+                    await self.bot.db.replace_room_openers(ctx.guild.id, channel.id, previous_openers)
+                    raise
         failed_disconnects = []
-        if not management and not enabled:
-            for member in members:
+        if not management and not opener and not enabled:
+            for member in changed:
                 if member.voice is not None and member.voice.channel == current:
                     try:
                         await member.move_to(None, reason=f"Room access removed by {ctx.author.id}")
@@ -219,12 +248,20 @@ class RoomCommands(commands.Cog):
                         failed_disconnects.append(member.id)
                         log.exception("Removed room member could not be disconnected channel_id=%s member_id=%s",
                                       current.id, member.id)
-        action = "Management" if management else "Join access" if enabled else "Join access and management"
-        detail = " They can still join." if management and not enabled else ""
+        action = "Management" if management else "Opener access" if opener else "Join access" if enabled else "All room access"
+        text = f"{action} {'granted' if enabled else 'revoked'} for {len(changed)} member(s)."
+        if management and not enabled and changed:
+            text += " They remain openers and can still open and join the room."
+        elif opener and not enabled and changed:
+            text += " They remain guests and can join while the room is visible."
+        if skipped_managers:
+            names = ", ".join(f"<@{member.id}>" for member in skipped_managers)
+            text += f"\nSkipped {names}: they are room managers, which includes opener access. Remove their manager permission first, then remove opener access."
+        if skipped_others:
+            text += "\nAlready without that permission: " + ", ".join(f"<@{member.id}>" for member in skipped_others) + "."
         if failed_disconnects:
-            detail += " Access was revoked, but some connected members could not be disconnected. Check the bot's Move Members permission."
-        await ctx.reply(f"{action} {'granted' if enabled else 'revoked'} for {len(members)} member(s).{detail}",
-                        allowed_mentions=discord.AllowedMentions.none())
+            text += "\nAccess was revoked, but some members could not be disconnected. Check the bot's Move Members permission."
+        await ctx.reply(text, allowed_mentions=discord.AllowedMentions.none())
 
     @room.group(name="manager", invoke_without_command=True)
     @commands.guild_only()
@@ -241,8 +278,26 @@ class RoomCommands(commands.Cog):
     @manager.command(name="remove")
     @commands.guild_only()
     async def manager_remove(self, ctx, channel: discord.VoiceChannel, *, members: str):
-        """Remove room management while keeping listed members able to join."""
+        """Remove management, leaving listed members as openers."""
         await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=True, enabled=False)
+
+    @room.group(name="opener", invoke_without_command=True)
+    @commands.guild_only()
+    async def opener(self, ctx):
+        """Manage who can open hidden rooms without managing them."""
+        await ctx.send_help(ctx.command)
+
+    @opener.command(name="add")
+    @commands.guild_only()
+    async def opener_add(self, ctx, channel: discord.VoiceChannel, *, members: str):
+        """Grant opening and joining without granting management."""
+        await self.update_members(ctx, channel, await self.parse_members(ctx, members), opener=True, enabled=True)
+
+    @opener.command(name="remove")
+    @commands.guild_only()
+    async def opener_remove(self, ctx, channel: discord.VoiceChannel, *, members: str):
+        """Downgrade openers to guests; managers must be demoted first."""
+        await self.update_members(ctx, channel, await self.parse_members(ctx, members), opener=True, enabled=False)
 
     @room.group(name="user", invoke_without_command=True)
     @commands.guild_only()
@@ -259,7 +314,7 @@ class RoomCommands(commands.Cog):
     @user.command(name="remove")
     @commands.guild_only()
     async def user_remove(self, ctx, channel: discord.VoiceChannel, *, members: str):
-        """Revoke joining and management, and disconnect listed members from this room."""
+        """Revoke joining, opening and management, and disconnect listed members."""
         await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=False, enabled=False)
 
     @room.command(name="delete")

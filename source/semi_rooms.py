@@ -173,7 +173,8 @@ class SemiRooms(commands.Cog):
                     log.exception("Lobby restriction update failed lobby_id=%s user_id=%s", lobby_id, user_id)
 
     async def set_visibility(self, channel, owner_id, *, hidden):
-        overwrites = visibility_overwrites(channel, owner_id, hidden)
+        openers = await self.db.list_room_openers(channel.guild.id, channel.id)
+        overwrites = visibility_overwrites(channel, owner_id, hidden, opener_ids=openers)
         if overwrites != channel.overwrites:
             await channel.edit(overwrites=overwrites, reason="Hide idle room" if hidden else "Reveal occupied room")
 

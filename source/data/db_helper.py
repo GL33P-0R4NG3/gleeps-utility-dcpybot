@@ -98,6 +98,13 @@ class DBHelper:
                     previous_connect INTEGER,
                     PRIMARY KEY (guild_id, lobby_id, user_id)
                 );
+                CREATE TABLE IF NOT EXISTS room_openers (
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, channel_id, user_id),
+                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS semi_rooms (
                     guild_id INTEGER NOT NULL,
                     channel_id INTEGER PRIMARY KEY,
@@ -367,6 +374,7 @@ class DBHelper:
                 """,
                 (guild_id, lobby_id, channel_id),
             )
+            await db.execute("DELETE FROM room_openers WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
             await db.commit()
 
     # -------------------------------------------------------------------------------
@@ -511,6 +519,7 @@ class DBHelper:
         async with self.connect() as db:
             await db.execute("DELETE FROM semi_rooms WHERE guild_id=? AND channel_id=?",
                              (guild_id, channel_id))
+            await db.execute("DELETE FROM room_openers WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
             await db.commit()
 
     async def list_lobbies(self, guild_id):
@@ -535,4 +544,18 @@ class DBHelper:
         async with self.connect() as db:
             await db.execute("DELETE FROM semi_lobby_locks WHERE guild_id=? AND lobby_id=? AND user_id=?",
                              (guild_id, lobby_id, user_id))
+            await db.commit()
+
+    async def list_room_openers(self, guild_id: int, channel_id: int) -> set[int]:
+        async with self.connect() as db:
+            async with db.execute("SELECT user_id FROM room_openers WHERE guild_id=? AND channel_id=?",
+                                  (guild_id, channel_id)) as cur:
+                return {row[0] for row in await cur.fetchall()}
+
+    async def replace_room_openers(self, guild_id: int, channel_id: int, user_ids: set[int]) -> None:
+        """Replace a room's opener grants atomically; callers hold its room lock."""
+        async with self.connect() as db:
+            await db.execute("DELETE FROM room_openers WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+            await db.executemany("INSERT INTO room_openers VALUES (?,?,?)",
+                                 [(guild_id, channel_id, user_id) for user_id in user_ids])
             await db.commit()
