@@ -2,9 +2,9 @@
 import discord
 
 
-def welcome_embed(role):
+def welcome_embed():
     embed = discord.Embed(
-        title="Welcome to your room!" if role.is_default() else "Welcome to your private room!",
+        title="Welcome to your private room!",
         description=(
             "This room is yours. You can change its name, user limit and who is allowed to join. "
             "Your settings stay in place when the room hides — it isn't deleted.\n\n"
@@ -16,16 +16,14 @@ def welcome_embed(role):
         colour=discord.Colour.blurple(),
     )
     embed.add_field(name="Who can join?", value=(
-        "Everyone can join this room while it is visible. When hidden, only you and room managers "
-        "can see and reopen it (server administrators retain their normal access)."
-        if role.is_default() else
-        f"Other members are blocked by default unless they have the access role {role.mention} "
-        "or you explicitly allow them in the channel's permissions. "
-        "If you linked an existing role, its members already have access while the room is visible."
+        "Only you have access initially (server administrators retain their normal access). "
+        "Use `/room user add` to let people join, or "
+        "`/room manager add` to let them manage and reopen the room too. Choose your room in the channel picker and mention the people you want to add. "
+        "No server roles are created."
     ), inline=False)
     embed.add_field(name="Need a hand?", value=(
         "Use **Setup help** below for a quick guide. If you accidentally remove your own "
-        "Manage Channel permission, type **`g!room fix`** in any server text channel."
+        "Manage Channel permission, use **`/room fix`** in any server text channel."
     ), inline=False)
     return embed
 
@@ -37,19 +35,21 @@ class RoomHelpView(discord.ui.View):
     @discord.ui.button(label="Setup help", style=discord.ButtonStyle.secondary,
                        custom_id="room:setup-help:v1")
     async def help(self, interaction, button):
-        channel_id = interaction.channel_id
         await interaction.response.send_message(
             "**Make this room your own**\n\n"
-            "• Open **Edit Channel** to change its name or user limit.\n"
-            "• Under **Permissions**, choose a member or role and allow **Connect** to let them join. "
-            "Keep **Connect** denied for `@everyone` if you want the room to stay private. "
-            "You can also ask a server administrator to assign the room's access role.\n"
-            f"• To let someone reopen the hidden room, use `g!room manager {channel_id} @member`. "
-            "This grants both management and join permission.\n"
-            "• Accidentally removed your own management permission? Use `g!room fix`. "
-            "It restores only that permission, and does nothing if you already have it.\n"
-            f"• To delete the room, use `g!room delete {channel_id}` and confirm.\n\n"
-            "Your room settings remain when it hides. The bot handles visibility automatically; "
-            "server administrators retain Discord's normal access.",
+            "Choose a slash command below, then select your room in the **channel** picker. "
+            "For commands with a **members** field, mention one or more people, separated by spaces. "
+            "No channel IDs needed!\n\n"
+            "• **Personalize it:** open **Edit Channel** to change the name or user limit.\n"
+            "• **Let people join:** `/room user add` grants joining without adding management permissions.\n"
+            "• **Add room managers:** `/room manager add` lets people manage the room and reopen it when hidden.\n"
+            "• **Remove managers:** `/room manager remove` removes management but keeps their join access.\n"
+            "• **Remove join access:** `/room user remove` removes joining and management, and disconnects them if they are in the room.\n"
+            "• **Recover your permissions:** `/room fix` restores your own missing Manage Channel permission. "
+            "You can leave the channel field empty to find your private room automatically.\n"
+            "• **Delete the room:** `/room delete` asks you to confirm first. Cancel or ignore the prompt to keep it.\n\n"
+            "After **15 minutes empty**, the room hides. Managers with join access can reopen it; "
+            "people with join-only access must wait until it is visible. Your settings stay in place. "
+            "Server administrators retain their normal access.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
         )

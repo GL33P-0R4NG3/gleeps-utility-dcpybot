@@ -34,12 +34,10 @@ class SemiRooms(commands.Cog):
     async def cog_unload(self):
         self.reconcile.cancel()
 
-    async def create_room(self, member, category, name, role=None, *, source_lobby=None):
+    async def create_room(self, member, category, name, *, source_lobby=None):
         guild = member.guild
         if not name.strip() or len(name) > 100:
             raise commands.BadArgument("Room names must contain 1–100 characters.")
-        if role is not None and role.guild.id != guild.id:
-            raise commands.BadArgument("Choose a role from this server.")
         async with self.lock(("owner", guild.id, member.id)):
             configured = [row for row in await self.db.list_lobbies(guild.id)
                           if row["settings_json"]["RoomMode"] == "semi"]
@@ -65,10 +63,6 @@ class SemiRooms(commands.Cog):
             if source_lobby is not None and (member.voice is None or member.voice.channel != source_lobby):
                 return None
             await self.db.get_settings_guild(guild.id)
-            created_role = role is None
-            if created_role:
-                role = await guild.create_role(name=f"Room: {name}"[:100], permissions=discord.Permissions.none(),
-                                               reason=f"Access role for {member.id}'s private room")
             channel = None
             tracked = False
             try:
@@ -78,11 +72,9 @@ class SemiRooms(commands.Cog):
                     guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True,
                                                          manage_permissions=True, send_messages=True),
                 }
-                # For @everyone this replaces the default Connect deny intentionally.
-                overwrites[role] = discord.PermissionOverwrite(view_channel=False, connect=True)
                 channel = await guild.create_voice_channel(name=name, category=category, overwrites=overwrites,
                                                            reason=f"Semi-temporary room requested by {member.id}")
-                await self.db.set_semi_room(guild.id, channel.id, member.id, role.id, created_role)
+                await self.db.set_semi_room(guild.id, channel.id, member.id)
                 tracked = True
                 if source_lobby is not None:
                     if member.voice is None or member.voice.channel != source_lobby:
@@ -100,27 +92,22 @@ class SemiRooms(commands.Cog):
                         log.exception("Private room rollback failed channel_id=%s", channel.id)
                         if not tracked:
                             try:
-                                await self.db.set_semi_room(guild.id, channel.id, member.id, role.id, created_role)
+                                await self.db.set_semi_room(guild.id, channel.id, member.id)
                             except Exception:
-                                log.critical("Private room needs manual recovery channel_id=%s role_id=%s", channel.id, role.id, exc_info=True)
+                                log.critical("Private room needs manual recovery channel_id=%s", channel.id, exc_info=True)
                 if channel_gone:
                     if tracked:
                         await self.db.delete_semi_room(guild.id, channel.id)
-                    if created_role:
-                        try:
-                            await role.delete(reason="Rolling back unused room access role")
-                        except discord.HTTPException:
-                            log.exception("Unused role rollback failed role_id=%s", role.id)
                 raise
             # Creation is complete. A visibility failure is retryable by reconciliation.
             try:
                 await self.set_visibility(channel, member.id, hidden=not bool(channel.voice_states))
             except discord.HTTPException:
                 log.exception("Initial hidden-room visibility needs retry channel_id=%s", channel.id)
-            log.info("Private room created guild_id=%s channel_id=%s owner_id=%s role_id=%s", guild.id, channel.id, member.id, role.id)
+            log.info("Private room created guild_id=%s channel_id=%s owner_id=%s", guild.id, channel.id, member.id)
             try:
                 await channel.send(f"Hey {member.mention}, your room is ready!",
-                                   embed=welcome_embed(role), view=RoomHelpView(),
+                                   embed=welcome_embed(), view=RoomHelpView(),
                                    allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False))
             except discord.HTTPException:
                 log.warning("Private room welcome could not be delivered channel_id=%s", channel.id, exc_info=True)
@@ -128,7 +115,7 @@ class SemiRooms(commands.Cog):
                 await self.sync_lobby_locks(guild)
             except Exception:
                 log.exception("Lobby locking needs retry guild_id=%s", guild.id)
-            return channel, role
+            return channel
 
     async def sync_lobby_locks(self, guild):
         """Persist Connect overrides so restrictions survive restarts and can be undone."""

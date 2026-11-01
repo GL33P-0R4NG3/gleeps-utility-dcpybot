@@ -116,10 +116,10 @@ class RoomCommands(commands.Cog):
 
     @room.command(name="semi")
     @commands.guild_only()
-    async def semi(self, ctx, role: Optional[discord.Role] = None, *, name: str):
-        """Create a private room: g!room semi [@AccessRole] Room name. One per person."""
+    async def semi(self, ctx, *, name: str):
+        """Create an owner-only room: g!room semi Room name. One per person."""
         service = self.bot.get_cog("SemiRooms")
-        channel, role = await service.create_room(ctx.author, getattr(ctx.channel, "category", None), name, role)
+        channel = await service.create_room(ctx.author, getattr(ctx.channel, "category", None), name)
         await ctx.reply(f"Your room is ready: {channel.mention}. "
                         "You'll find a welcome message and setup help in its chat.",
                         allowed_mentions=discord.AllowedMentions.none())
@@ -169,37 +169,98 @@ class RoomCommands(commands.Cog):
         await ctx.reply(f"Your Manage Channel permission for <#{channel_id}> is restored.",
                         allowed_mentions=discord.AllowedMentions.none())
 
-    @room.command(name="manager")
-    @commands.guild_only()
-    async def manager(self, ctx, channel: discord.VoiceChannel, member: discord.Member, enabled: bool = True):
-        """Grant room management and join permission; append false to revoke management."""
-        mode, row = await self.managed_room(channel, ctx.author)
+    async def parse_members(self, ctx, text):
+        tokens = text.replace(",", " ").split()
+        if not tokens or len(tokens) > 25:
+            raise commands.BadArgument("Mention between 1 and 25 members, separated by spaces or commas.")
+        members = {}
+        for token in tokens:
+            member = await commands.MemberConverter().convert(ctx, token)
+            members[member.id] = member
+        return list(members.values())
 
-        async def apply(current, current_row):
+    async def update_members(self, ctx, channel, members, *, management, enabled):
+        # Resolve every member before changing anything, then edit all overwrites
+        # in one API operation. The current permissions are rechecked under lock.
+        service = self.bot.get_cog("SemiRooms")
+        async with service.lock(("channel", channel.id)):
+            current = await ctx.guild.fetch_channel(channel.id)
+            mode, row = await self.managed_room(current, ctx.author)
+            if not enabled and any(member.id == row["owner_id"] for member in members):
+                raise commands.BadArgument("The room owner's access and management cannot be revoked with this command.")
             overwrites = current.overwrites
-            overwrite = overwrites.setdefault(member, discord.PermissionOverwrite())
-            overwrite.manage_channels = enabled
-            if enabled:
-                overwrite.connect = True
-                overwrite.view_channel = True
-            if mode == "semi-temporary" and current_row["hidden"]:
-                overwrites = visibility_overwrites(current, current_row["owner_id"], True,
+            for member in members:
+                overwrite = overwrites.setdefault(member, discord.PermissionOverwrite())
+                if management:
+                    overwrite.manage_channels = enabled
+                    overwrite.connect = True
+                    if enabled:
+                        overwrite.view_channel = True
+                    else:
+                        overwrite.manage_permissions = False
+                else:
+                    overwrite.connect = enabled
+                    if enabled:
+                        overwrite.view_channel = True
+                    else:
+                        overwrite.manage_channels = False
+                        overwrite.manage_permissions = False
+            if mode == "semi-temporary":
+                overwrites = visibility_overwrites(current, row["owner_id"], bool(row["hidden"]),
                                                    source_overwrites=overwrites)
-            # Apply management and hidden-state visibility together. set_permissions
-            # followed by a cached channel read could overwrite the new grant.
-            await current.edit(overwrites=overwrites, reason=f"Room management updated by {ctx.author.id}")
-
-        if mode == "semi-temporary":
-            service = self.bot.get_cog("SemiRooms")
-            async with service.lock(("channel", channel.id)):
-                current = await ctx.guild.fetch_channel(channel.id)
-                _, row = await self.managed_room(current, ctx.author)
-                await apply(current, row)
-        else:
-            await apply(channel, row)
-        await ctx.reply(f"Room management {'granted' if enabled else 'revoked'} for {member.mention}. "
-                        + ("They can see and reopen the room." if enabled else "Existing join permission is unchanged."),
+            await current.edit(overwrites=overwrites, reason=f"Room member permissions updated by {ctx.author.id}")
+        failed_disconnects = []
+        if not management and not enabled:
+            for member in members:
+                if member.voice is not None and member.voice.channel == current:
+                    try:
+                        await member.move_to(None, reason=f"Room access removed by {ctx.author.id}")
+                    except discord.HTTPException:
+                        failed_disconnects.append(member.id)
+                        log.exception("Removed room member could not be disconnected channel_id=%s member_id=%s",
+                                      current.id, member.id)
+        action = "Management" if management else "Join access" if enabled else "Join access and management"
+        detail = " They can still join." if management and not enabled else ""
+        if failed_disconnects:
+            detail += " Access was revoked, but some connected members could not be disconnected. Check the bot's Move Members permission."
+        await ctx.reply(f"{action} {'granted' if enabled else 'revoked'} for {len(members)} member(s).{detail}",
                         allowed_mentions=discord.AllowedMentions.none())
+
+    @room.group(name="manager", invoke_without_command=True)
+    @commands.guild_only()
+    async def manager(self, ctx):
+        """Add or remove room managers."""
+        await ctx.send_help(ctx.command)
+
+    @manager.command(name="add")
+    @commands.guild_only()
+    async def manager_add(self, ctx, channel: discord.VoiceChannel, *, members: str):
+        """Grant listed members room management and join access."""
+        await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=True, enabled=True)
+
+    @manager.command(name="remove")
+    @commands.guild_only()
+    async def manager_remove(self, ctx, channel: discord.VoiceChannel, *, members: str):
+        """Remove room management while keeping listed members able to join."""
+        await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=True, enabled=False)
+
+    @room.group(name="user", invoke_without_command=True)
+    @commands.guild_only()
+    async def user(self, ctx):
+        """Add or remove room join access."""
+        await ctx.send_help(ctx.command)
+
+    @user.command(name="add")
+    @commands.guild_only()
+    async def user_add(self, ctx, channel: discord.VoiceChannel, *, members: str):
+        """Let listed members join without granting room management."""
+        await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=False, enabled=True)
+
+    @user.command(name="remove")
+    @commands.guild_only()
+    async def user_remove(self, ctx, channel: discord.VoiceChannel, *, members: str):
+        """Revoke joining and management, and disconnect listed members from this room."""
+        await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=False, enabled=False)
 
     @room.command(name="delete")
     @commands.guild_only()

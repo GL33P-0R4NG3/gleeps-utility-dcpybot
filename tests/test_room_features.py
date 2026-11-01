@@ -261,7 +261,7 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         member.move_to.assert_not_awaited()
         channel.send.assert_not_awaited()
 
-    async def test_failed_lobby_move_rolls_back_room_and_new_role(self):
+    async def test_failed_lobby_move_rolls_back_room_without_touching_roles(self):
         service, guild, member, channel, role = self.semi_creation_fixture()
         lobby = Mock()
         member.voice = SimpleNamespace(channel=lobby)
@@ -269,7 +269,7 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(discord.Forbidden):
             await service.create_room(member, None, "Private room", source_lobby=lobby)
         channel.delete.assert_awaited_once()
-        role.delete.assert_awaited_once()
+        role.delete.assert_not_awaited()
         self.assertIsNone(await self.db.get_semi_room(1, 21))
 
     async def test_lobby_lock_restores_previous_connect_after_restart(self):
@@ -304,15 +304,18 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await VoiceChannels(Mock(), self.db).create_room(Mock(id=10, guild=guild), Mock(id=2))
         guild.create_voice_channel.assert_not_awaited()
 
-    async def test_semi_creation_creates_minimal_role_and_hidden_record(self):
+    async def test_semi_creation_creates_owner_only_room_without_roles(self):
         service, guild, member, channel, role = self.semi_creation_fixture()
-        created, access = await service.create_room(member, None, "Private room")
+        created = await service.create_room(member, None, "Private room")
         self.assertIs(created, channel)
-        self.assertIs(access, role)
-        self.assertEqual(guild.create_role.await_args.kwargs["permissions"].value, 0)
+        guild.create_role.assert_not_awaited()
+        overwrites = guild.create_voice_channel.await_args.kwargs["overwrites"]
+        self.assertEqual(set(overwrites), {guild.default_role, guild.me, member})
+        self.assertFalse(overwrites[guild.default_role].connect)
         row = await self.db.get_semi_room(1, 21)
         self.assertEqual(row["hidden"], 1)
-        self.assertEqual(row["created_role"], 1)
+        self.assertEqual(row["created_role"], 0)
+        self.assertIsNone(row["role_id"])
         channel.send.assert_awaited_once()
         welcome = channel.send.await_args.kwargs
         self.assertTrue(welcome["view"].is_persistent())
@@ -329,39 +332,20 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         channel.delete.assert_not_awaited()
         role.delete.assert_not_awaited()
 
-    async def test_everyone_access_reuses_role_and_allows_connect(self):
-        service, guild, member, channel, role = self.semi_creation_fixture()
-        guild.default_role = role
-        role.is_default.return_value = True
-        await service.create_room(member, None, "Open room", role)
-        guild.create_role.assert_not_awaited()
-        overwrite = guild.create_voice_channel.await_args.kwargs["overwrites"][role]
-        self.assertTrue(overwrite.connect)
-        self.assertFalse(overwrite.view_channel)  # Still starts hidden.
-        welcome = channel.send.await_args.kwargs["embed"]
-        self.assertIn("Everyone can join", welcome.fields[0].value)
-        self.assertEqual((await self.db.get_semi_room(1, 21))["created_role"], 0)
-
-    async def test_semi_creation_links_existing_role_without_modifying_it(self):
-        service, guild, member, channel, role = self.semi_creation_fixture()
-        await service.create_room(member, None, "Private room", role)
-        guild.create_role.assert_not_awaited()
-        role.edit.assert_not_called()
-        self.assertEqual((await self.db.get_semi_room(1, 21))["created_role"], 0)
-        overwrites = guild.create_voice_channel.await_args.kwargs["overwrites"]
-        self.assertTrue(overwrites[role].connect)
-        self.assertFalse(overwrites[guild.default_role].connect)
-
-    async def test_semi_failed_channel_creation_removes_only_new_role(self):
-        for linked in (False, True):
-            service, guild, member, channel, role = self.semi_creation_fixture()
-            guild.create_voice_channel.side_effect = discord_error(discord.Forbidden)
-            with self.assertRaises(discord.Forbidden):
-                await service.create_room(member, None, "Private room", role if linked else None)
-            if linked:
-                role.delete.assert_not_awaited()
-            else:
-                role.delete.assert_awaited_once()
+    async def test_legacy_room_role_migration_preserves_rows(self):
+        await self.db.set_semi_room(1, 21, 10, 30, True)
+        with closing(sqlite3.connect(self.db.path)) as conn, conn:
+            sql = conn.execute("SELECT sql FROM sqlite_master WHERE name='semi_rooms'").fetchone()[0]
+            rows = conn.execute("SELECT * FROM semi_rooms").fetchall()
+            conn.execute("DROP TABLE semi_rooms")
+            conn.execute(sql.replace("role_id INTEGER,", "role_id INTEGER NOT NULL,"))
+            conn.executemany("INSERT INTO semi_rooms VALUES (?,?,?,?,?,?,?)", rows)
+        await self.db.init()
+        row = await self.db.get_semi_room(1, 21)
+        self.assertEqual(row["role_id"], 30)
+        await self.db.set_semi_room(1, 22, 11)
+        self.assertIsNone((await self.db.get_semi_room(1, 22))["role_id"])
+        self.assertTrue(list(Path(self.temp.name).glob("*.backup-*.db")))
 
     async def test_confirmed_deletion_clears_saved_preset_after_event(self):
         await self.db.set_settings_user(1, 2, 10, {"channel_name": "old saved name"})
@@ -502,13 +486,27 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             await set_lobby.callback(ctx, "semi", channel, ctx.guild.default_role)
         ctx.bot.db.update_lobby_setting.assert_any_await(ctx.guild.id, 20, "GateRoleID", ctx.guild.default_role.id)
 
-    async def test_optional_role_parser_allows_name_only(self):
+    async def test_setlobby_without_role_preserves_existing_gate_without_creating_roles(self):
+        from utility_bot import set_lobby
+        role = Mock(id=99)
+        role.is_default.return_value = False
+        ctx = Mock(reply=AsyncMock())
+        ctx.guild.get_role.return_value = role
+        ctx.guild.create_role = AsyncMock()
+        ctx.bot.db.get_lobby = AsyncMock(return_value={"settings_json": {"GateRoleID": 99}})
+        ctx.bot.db.update_lobby_setting = AsyncMock()
+        ctx.bot.get_cog.return_value.sync_lobby_locks = AsyncMock()
+        with patch("utility_bot.apply_lobby_gate", new=AsyncMock()):
+            await set_lobby.callback(ctx, "semi", Mock(id=20))
+        ctx.bot.db.update_lobby_setting.assert_any_await(ctx.guild.id, 20, "GateRoleID", 99)
+        ctx.guild.create_role.assert_not_awaited()
+
+    async def test_semi_parser_treats_whole_input_as_name(self):
         cog = RoomCommands(Mock())
         command = cog.semi
         ctx = Mock(command=command, guild=Mock(roles=[]), message=Mock(attachments=[]), interaction=None)
         ctx.view = StringView("My private room")
         await command._parse_arguments(ctx)
-        self.assertIsNone(ctx.args[-1])
         self.assertEqual(ctx.kwargs["name"], "My private room")
 
     async def test_sql_command_and_modal_deny_non_owner(self):
@@ -541,18 +539,92 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         cog = RoomCommands(bot)
         cog.managed_room = AsyncMock(return_value=("semi-temporary", {"owner_id": owner.id, "hidden": 1}))
         ctx = Mock(author=owner, guild=channel.guild, reply=AsyncMock())
-        await cog.manager.callback(cog, ctx, channel, guest, True)
+        await cog.update_members(ctx, channel, [guest], management=True, enabled=True)
         channel.edit.assert_awaited_once()
         overwrite = channel.edit.await_args.kwargs["overwrites"][guest]
         self.assertTrue(overwrite.manage_channels)
         self.assertTrue(overwrite.connect)
         self.assertTrue(overwrite.view_channel)
         channel.edit.reset_mock()
-        await cog.manager.callback(cog, ctx, channel, guest, False)
+        await cog.update_members(ctx, channel, [guest], management=True, enabled=False)
         overwrite = channel.edit.await_args.kwargs["overwrites"][guest]
         self.assertFalse(overwrite.manage_channels)
         self.assertFalse(overwrite.view_channel)
         self.assertTrue(overwrite.connect)
+
+    async def test_batch_access_does_not_grant_management_or_expose_hidden_room(self):
+        channel, owner, manager, guest, _ = permission_fixture()
+        channel.guild.fetch_channel = AsyncMock(return_value=channel)
+        channel.edit = AsyncMock()
+        bot = Mock()
+        bot.get_cog.return_value = SemiRooms(bot, Mock())
+        cog = RoomCommands(bot)
+        cog.managed_room = AsyncMock(return_value=("semi-temporary", {"owner_id": owner.id, "hidden": 1}))
+        ctx = Mock(guild=channel.guild, author=owner, reply=AsyncMock())
+        another = Mock(spec=discord.Member, id=40, roles=[], guild_permissions=discord.Permissions.none())
+        channel.guild.members.append(another)
+        await cog.update_members(ctx, channel, [guest, another], management=False, enabled=True)
+        channel.edit.assert_awaited_once()
+        values = channel.edit.await_args.kwargs["overwrites"]
+        for member in (guest, another):
+            self.assertTrue(values[member].connect)
+            self.assertIsNone(values[member].manage_channels)
+            self.assertFalse(values[member].view_channel)
+        self.assertFalse(values[guest].speak)
+
+    async def test_batch_manager_owner_protection_and_authorization(self):
+        channel, owner, manager, guest, _ = permission_fixture()
+        channel.guild.fetch_channel = AsyncMock(return_value=channel)
+        channel.edit = AsyncMock()
+        bot = Mock()
+        bot.get_cog.return_value = SemiRooms(bot, Mock())
+        cog = RoomCommands(bot)
+        cog.managed_room = AsyncMock(return_value=("semi-temporary", {"owner_id": owner.id, "hidden": 1}))
+        ctx = Mock(guild=channel.guild, author=owner, reply=AsyncMock())
+        await cog.update_members(ctx, channel, [manager, guest], management=True, enabled=True)
+        values = channel.edit.await_args.kwargs["overwrites"]
+        for member in (manager, guest):
+            self.assertTrue(values[member].manage_channels)
+            self.assertTrue(values[member].connect)
+            self.assertTrue(values[member].view_channel)
+        channel.edit.reset_mock()
+        with self.assertRaises(commands.BadArgument):
+            await cog.update_members(ctx, channel, [owner, guest], management=False, enabled=False)
+        channel.edit.assert_not_awaited()
+        cog.managed_room.side_effect = commands.CheckFailure("denied")
+        with self.assertRaises(commands.CheckFailure):
+            await cog.update_members(ctx, channel, [guest], management=False, enabled=True)
+        channel.edit.assert_not_awaited()
+
+    async def test_user_remove_revokes_manager_and_disconnects(self):
+        channel, owner, manager, guest, _ = permission_fixture()
+        channel.guild.fetch_channel = AsyncMock(return_value=channel)
+        channel.edit = AsyncMock()
+        manager.voice = SimpleNamespace(channel=channel)
+        manager.move_to = AsyncMock()
+        channel.overwrites[manager] = discord.PermissionOverwrite(manage_channels=True, manage_permissions=True, connect=True)
+        bot = Mock()
+        bot.get_cog.return_value = SemiRooms(bot, Mock())
+        cog = RoomCommands(bot)
+        cog.managed_room = AsyncMock(return_value=("semi-temporary", {"owner_id": owner.id, "hidden": 1}))
+        ctx = Mock(guild=channel.guild, author=owner, reply=AsyncMock())
+        await cog.update_members(ctx, channel, [manager], management=False, enabled=False)
+        permissions = channel.edit.await_args.kwargs["overwrites"][manager]
+        self.assertFalse(permissions.connect)
+        self.assertFalse(permissions.manage_channels)
+        self.assertFalse(permissions.manage_permissions)
+        self.assertFalse(permissions.view_channel)
+        manager.move_to.assert_awaited_once()
+        self.assertIsNone(manager.move_to.await_args.args[0])
+
+    async def test_member_list_deduplicates_and_rejects_unknown_member(self):
+        cog = RoomCommands(Mock())
+        member = Mock(id=10)
+        with patch.object(commands.MemberConverter, "convert", new=AsyncMock(return_value=member)):
+            self.assertEqual(await cog.parse_members(Mock(), "<@10>, <@10>"), [member])
+        with patch.object(commands.MemberConverter, "convert", new=AsyncMock(side_effect=commands.BadArgument("unknown"))):
+            with self.assertRaises(commands.BadArgument):
+                await cog.parse_members(Mock(), "unknown")
 
     async def test_cancel_keeps_room_and_stops_confirmation(self):
         cog = Mock()

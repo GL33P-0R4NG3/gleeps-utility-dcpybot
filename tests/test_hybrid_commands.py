@@ -22,12 +22,15 @@ class HybridCommandTests(unittest.IsolatedAsyncioTestCase):
         payloads = {cmd.name: cmd.to_dict(self.bot.tree) for cmd in self.bot.tree.get_commands()}
         self.assertEqual(set(payloads), {"room", "sql", "setlobby"})
         self.assertEqual({option["name"] for option in payloads["room"]["options"]},
-                         {"help", "semi", "fix", "manager", "delete"})
+                         {"help", "semi", "fix", "manager", "user", "delete"})
+        groups = {option["name"]: option for option in payloads["room"]["options"]}
+        for name in ("manager", "user"):
+            self.assertEqual({item["name"] for item in groups[name]["options"]}, {"add", "remove"})
         options = {option["name"]: option for option in payloads["setlobby"]["options"]}
         self.assertEqual(options["role"]["type"], discord.AppCommandOptionType.role.value)
         self.assertEqual(options["channel"]["type"], discord.AppCommandOptionType.channel.value)
         self.assertEqual({choice["value"] for choice in options["mode"]["choices"]}, {"temp", "semi"})
-        for name in ("setlobby", "sql", "room fix", "room semi", "room manager", "room delete"):
+        for name in ("setlobby", "sql", "room fix", "room semi", "room manager add", "room manager remove", "room user add", "room user remove", "room delete"):
             self.assertIsInstance(self.bot.get_command(name), commands.HybridCommand)
         self.bot.tree.sync.assert_awaited_once()
 

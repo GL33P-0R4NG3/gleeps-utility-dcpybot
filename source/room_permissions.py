@@ -42,7 +42,9 @@ def visibility_overwrites(channel, owner_id, hidden, *, source_overwrites=None):
     if hidden:
         # Member-specific grants avoid a conflicting role's visibility exposing the
         # room to non-managers. Existing member denies cannot mask a real manager.
-        for member in channel.guild.members:
+        candidates = {member.id: member for member in channel.guild.members}
+        candidates.update({target.id: target for target in source if isinstance(target, discord.Member)})
+        for member in candidates.values():
             if can_manage_room(channel, member, owner_id, overwrites=source):
                 overwrites.setdefault(member, discord.PermissionOverwrite()).view_channel = True
         if channel.guild.me is not None:

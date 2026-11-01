@@ -35,7 +35,10 @@ class DBHelper:
                     keys = await cur.fetchall()
                 if any(row[2] == "lobbies" and row[3] == "lobby_id" and row[1] == 0 for row in keys):
                     legacy = True
-            if legacy:
+            async with db.execute("PRAGMA table_info(semi_rooms)") as cur:
+                semi_columns = await cur.fetchall()
+            migrate_semi = any(row[1] == "role_id" and row[3] for row in semi_columns)
+            if legacy or migrate_semi:
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                 backup = Path(f"{self.path}.backup-{stamp}.db")
                 async with aiosqlite.connect(backup) as target:
@@ -47,6 +50,8 @@ class DBHelper:
                 if legacy:
                     for table in ("users", "voice_channels"):
                         await db.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+                if migrate_semi:
+                    await db.execute("ALTER TABLE semi_rooms RENAME TO semi_rooms_legacy")
                 schema = """
                 CREATE TABLE IF NOT EXISTS guilds (
                     guild_id      INTEGER PRIMARY KEY,
@@ -97,7 +102,7 @@ class DBHelper:
                     guild_id INTEGER NOT NULL,
                     channel_id INTEGER PRIMARY KEY,
                     owner_id INTEGER NOT NULL,
-                    role_id INTEGER NOT NULL,
+                    role_id INTEGER,
                     created_role INTEGER NOT NULL DEFAULT 0,
                     expires_at INTEGER,
                     hidden INTEGER NOT NULL DEFAULT 1,
@@ -112,6 +117,9 @@ class DBHelper:
                     for table in ("users", "voice_channels"):
                         await db.execute(f"INSERT INTO {table} SELECT * FROM {table}_legacy")
                         await db.execute(f"DROP TABLE {table}_legacy")
+                if migrate_semi:
+                    await db.execute("INSERT INTO semi_rooms SELECT * FROM semi_rooms_legacy")
+                    await db.execute("DROP TABLE semi_rooms_legacy")
                 async with db.execute("PRAGMA foreign_key_check") as cur:
                     violations = await cur.fetchall()
                 if violations:
@@ -465,7 +473,7 @@ class DBHelper:
             await db.commit()
 
     async def set_semi_room(self, guild_id: int, channel_id: int, owner_id: int,
-                            role_id: int, created_role: bool) -> None:
+                            role_id: Optional[int] = None, created_role: bool = False) -> None:
         async with self.connect() as db:
             await db.execute(
                 "INSERT INTO semi_rooms (guild_id,channel_id,owner_id,role_id,created_role) VALUES (?,?,?,?,?)",

@@ -84,7 +84,7 @@ class AccessRoleConverter(commands.RoleConverter, discord.app_commands.Transform
 @discord.app_commands.choices(mode=[discord.app_commands.Choice(name="Temporary", value="temp"),
                                    discord.app_commands.Choice(name="Semi-temporary", value="semi")])
 @discord.app_commands.describe(mode="Room type", channel="Voice channel members join to create a room",
-                               role="Who may enter this lobby and create rooms; omit to create a gate role")
+                               role="Existing role allowed to create rooms; omit to keep the gate (everyone for a new lobby)")
 @commands.guild_only()
 @commands.has_guild_permissions(manage_guild=True)
 async def set_lobby(ctx: commands.Context, mode: str, channel: discord.VoiceChannel,
@@ -93,11 +93,13 @@ async def set_lobby(ctx: commands.Context, mode: str, channel: discord.VoiceChan
     mode = {"temp": "temporary", "temporary": "temporary", "semi": "semi"}.get(mode.lower())
     if mode is None:
         raise commands.BadArgument("Choose temp or semi as the lobby type.")
-    if role is None:
-        role = await ctx.guild.create_role(name=f"Create room: {channel.name}"[:100],
-                                           permissions=discord.Permissions.none(),
-                                           reason=f"Lobby gate configured by {ctx.author.id}")
     existing = await ctx.bot.db.get_lobby(ctx.guild.id, channel.id)
+    if role is None:
+        from lobby_access import gate_role_id
+        previous = gate_role_id(existing["settings_json"]) if existing else None
+        role = ctx.guild.get_role(previous) if previous else ctx.guild.default_role
+        if role is None:
+            raise commands.BadArgument("The previous gate role was deleted. Choose an existing role or everyone.")
     if existing is None:
         settings = await ctx.bot.db.get_settings_guild(ctx.guild.id)
         await ctx.bot.db.set_lobby(ctx.guild.id, channel.id, settings)
