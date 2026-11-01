@@ -443,7 +443,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_optional_role_parser_allows_name_only(self):
         cog = RoomCommands(Mock())
         command = cog.semi
-        ctx = Mock(command=command, guild=Mock(roles=[]), message=Mock(attachments=[]))
+        ctx = Mock(command=command, guild=Mock(roles=[]), message=Mock(attachments=[]), interaction=None)
         ctx.view = StringView("My private room")
         await command._parse_arguments(ctx)
         self.assertIsNone(ctx.args[-1])

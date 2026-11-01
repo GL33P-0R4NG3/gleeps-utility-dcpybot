@@ -21,6 +21,12 @@ class UtilityBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="g!", intents=intents)
         self.db = db if db is not None else DBHelper()
+        self.before_invoke(self.defer_slash_response)
+
+    async def defer_slash_response(self, ctx):
+        # Room creation and DB operations can exceed Discord's response deadline.
+        if ctx.interaction is not None:
+            await ctx.defer(ephemeral=True)
 
     async def setup_hook(self):
         await self.db.init()
@@ -29,6 +35,9 @@ class UtilityBot(commands.Bot):
         await self.add_cog(SemiRooms(self, self.db))
         await self.add_cog(RoomCommands(self))
         await self.add_cog(SQLConsole(self))
+        self.add_command(set_lobby.copy())
+        synced = await self.tree.sync()
+        log.info("Slash commands registered count=%s", len(synced))
 
     async def on_ready(self):
         log.info("Bot ready user_id=%s", self.user.id)
@@ -54,14 +63,27 @@ class UtilityBot(commands.Bot):
 BOT = UtilityBot()
 
 
-class AccessRoleConverter(commands.RoleConverter):
+class AccessRoleConverter(commands.RoleConverter, discord.app_commands.Transformer):
+    @property
+    def type(self):
+        return discord.AppCommandOptionType.role
+
+    async def transform(self, interaction, value):
+        return value
+
     async def convert(self, ctx, argument):
         if argument.lower() in ("everyone", "@everyone"):
             return ctx.guild.default_role
         return await super().convert(ctx, argument)
 
 
-@BOT.command(name="setlobby")
+@commands.hybrid_command(name="setlobby")
+@discord.app_commands.guild_only()
+@discord.app_commands.default_permissions(manage_guild=True)
+@discord.app_commands.choices(mode=[discord.app_commands.Choice(name="Temporary", value="temp"),
+                                   discord.app_commands.Choice(name="Semi-temporary", value="semi")])
+@discord.app_commands.describe(mode="Room type", channel="Voice channel members join to create a room",
+                               role="Access role for semi rooms; omit to create one for each room")
 @commands.guild_only()
 @commands.has_guild_permissions(manage_guild=True)
 async def set_lobby(ctx: commands.Context, mode: str, channel: discord.VoiceChannel,

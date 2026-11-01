@@ -74,11 +74,11 @@ class SQLConsole(commands.Cog):
         self.bot = bot
         self.lock = asyncio.Lock()
 
-    @commands.command(name="sql")
+    @commands.hybrid_command(name="sql")
     @commands.is_owner()
     async def sql(self, ctx):
         """Open a private SQL form (bot owner only; works in DMs too)."""
         await ctx.reply("Bot database console. Reads and writes affect the **whole bot database**. "
                         "Writes run immediately with a backup; one statement per submission. "
                         "Deleting tracking rows does not delete Discord channels or roles. "
-                        "The form and results are private.", view=SQLView(self, ctx.author.id))
+                        "The form and results are private.", view=SQLView(self, ctx.author.id), ephemeral=True)

@@ -88,9 +88,11 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         from utility_bot import UtilityBot
         db = Mock(init=AsyncMock())
         bot = UtilityBot(db)
+        bot.tree.sync = AsyncMock(return_value=[])
         async with bot:
             await bot.setup_hook()
             db.init.assert_awaited_once()
+            bot.tree.sync.assert_awaited_once()
             cog = bot.get_cog("VoiceChannels")
             self.assertIsNotNone(cog)
             self.assertTrue(cog.prune_expired.is_running())

@@ -107,7 +107,8 @@ class RoomCommands(commands.Cog):
             raise commands.CheckFailure("Only the room owner or a member with room Manage Channels can do that.")
         return mode, row
 
-    @commands.group(name="room", invoke_without_command=True)
+    @commands.hybrid_group(name="room", invoke_without_command=True, fallback="help")
+    @discord.app_commands.guild_only()
     @commands.guild_only()
     async def room(self, ctx):
         """Create, manage, or delete bot-managed voice rooms."""
