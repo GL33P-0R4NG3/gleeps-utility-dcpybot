@@ -36,17 +36,24 @@ def visibility_overwrites(channel, owner_id, hidden, *, source_overwrites=None):
     source = channel.overwrites if source_overwrites is None else source_overwrites
     overwrites = {target: discord.PermissionOverwrite.from_pair(*value.pair())
                   for target, value in source.items()}
-    overwrites.setdefault(channel.guild.default_role, discord.PermissionOverwrite())
-    for overwrite in overwrites.values():
-        overwrite.view_channel = not hidden
-    if hidden:
-        # Member-specific grants avoid a conflicting role's visibility exposing the
-        # room to non-managers. Existing member denies cannot mask a real manager.
-        candidates = {member.id: member for member in channel.guild.members}
-        candidates.update({target.id: target for target in source if isinstance(target, discord.Member)})
-        for member in candidates.values():
-            if can_manage_room(channel, member, owner_id, overwrites=source):
-                overwrites.setdefault(member, discord.PermissionOverwrite()).view_channel = True
-        if channel.guild.me is not None:
-            overwrites.setdefault(channel.guild.me, discord.PermissionOverwrite()).view_channel = True
+    for target, overwrite in overwrites.items():
+        visible = not hidden
+        if hidden:
+            if target.id == owner_id or (channel.guild.me is not None and target.id == channel.guild.me.id):
+                visible = True
+            elif isinstance(target, discord.Member):
+                visible = can_manage_room(channel, target, owner_id, overwrites=source)
+            elif isinstance(target, discord.Role):
+                # Resolve only this existing role's management grant. Never expand
+                # role membership into new per-member overwrites.
+                visible = target.permissions.manage_channels
+                everyone = source.get(channel.guild.default_role, discord.PermissionOverwrite()).manage_channels
+                if everyone is not None:
+                    visible = everyone
+                if overwrite.manage_channels is not None:
+                    visible = overwrite.manage_channels
+            else:
+                # Uncached targets still retain an explicit management grant.
+                visible = overwrite.manage_channels is True
+        overwrite.view_channel = visible
     return overwrites

@@ -28,9 +28,9 @@ def discord_error(kind=discord.NotFound):
 
 
 def permission_fixture():
-    everyone = Mock(spec=discord.Role, id=1)
-    access = Mock(spec=discord.Role, id=2)
-    manager_role = Mock(spec=discord.Role, id=3)
+    everyone = Mock(spec=discord.Role, id=1, permissions=discord.Permissions.none())
+    access = Mock(spec=discord.Role, id=2, permissions=discord.Permissions.none())
+    manager_role = Mock(spec=discord.Role, id=3, permissions=discord.Permissions.none())
     owner = Mock(spec=discord.Member, id=10, roles=[everyone], guild_permissions=discord.Permissions.none())
     manager = Mock(spec=discord.Member, id=11, roles=[everyone, manager_role], guild_permissions=discord.Permissions.none())
     guest = Mock(spec=discord.Member, id=12, roles=[everyone, access], guild_permissions=discord.Permissions.none())
@@ -54,7 +54,8 @@ class PermissionTests(unittest.TestCase):
         channel, owner, manager, guest, access = permission_fixture()
         hidden = visibility_overwrites(channel, owner.id, True)
         self.assertTrue(hidden[owner].view_channel)
-        self.assertTrue(hidden[manager].view_channel)
+        self.assertNotIn(manager, hidden)
+        self.assertTrue(hidden[manager.roles[-1]].view_channel)
         self.assertFalse(hidden[guest].view_channel)
         self.assertFalse(hidden[access].view_channel)
         view_bit = discord.Permissions(view_channel=True).value
@@ -68,6 +69,24 @@ class PermissionTests(unittest.TestCase):
         self.assertFalse(shown[channel.guild.default_role].connect)
         self.assertTrue(shown[access].connect)
         self.assertFalse(shown[guest].speak)
+
+    def test_visibility_never_adds_users_roles_or_bots(self):
+        channel, owner, manager, guest, access = permission_fixture()
+        admin_bot = Mock(spec=discord.Member, id=99, guild_permissions=discord.Permissions(administrator=True))
+        channel.guild.members.append(admin_bot)
+        original_targets = set(channel.overwrites)
+        hidden = visibility_overwrites(channel, owner.id, True)
+        self.assertEqual(set(hidden), original_targets)
+        self.assertNotIn(admin_bot, hidden)
+        self.assertNotIn(manager, hidden)
+        channel.overwrites = hidden
+        self.assertEqual(set(visibility_overwrites(channel, owner.id, False)), original_targets)
+
+    def test_visibility_does_not_reinsert_deleted_default_or_bot_overwrites(self):
+        channel, owner, manager, guest, access = permission_fixture()
+        del channel.overwrites[channel.guild.default_role]
+        del channel.overwrites[channel.guild.me]
+        self.assertEqual(set(visibility_overwrites(channel, owner.id, True)), set(channel.overwrites))
 
     def test_manager_resolution_ignores_visibility_but_respects_explicit_denial(self):
         channel, owner, manager, guest, access = permission_fixture()
@@ -319,7 +338,7 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_awaited_once()
         welcome = channel.send.await_args.kwargs
         self.assertTrue(welcome["view"].is_persistent())
-        self.assertIn("15 minutes empty", welcome["embed"].description)
+        self.assertIn("5 minutes empty", welcome["embed"].description)
         self.assertEqual(welcome["allowed_mentions"].users, [member])
         service.set_visibility.assert_awaited_once_with(channel, 10, hidden=True)
 
@@ -386,7 +405,7 @@ class SemiRoomLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_room_gets_timer_not_deleted(self):
         await self.service.reconcile_room(self.row)
         values = self.db.update_semi_state.await_args.kwargs
-        self.assertAlmostEqual(values["expires_at"], int(time.time()) + 900, delta=2)
+        self.assertAlmostEqual(values["expires_at"], int(time.time()) + 300, delta=2)
         self.assertFalse(values["hidden"])
         self.channel.delete.assert_not_awaited()
 
@@ -415,6 +434,17 @@ class SemiRoomLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await self.service.reconcile_room(self.row)
         self.db.update_semi_state.assert_not_awaited()
         self.db.delete_semi_room.assert_not_awaited()
+
+    async def test_old_deadline_is_shortened_to_five_minutes(self):
+        self.row["expires_at"] = int(time.time()) + 850
+        await self.service.reconcile_room(self.row)
+        self.assertAlmostEqual(self.db.update_semi_state.await_args.kwargs["expires_at"], int(time.time()) + 300, delta=2)
+
+    async def test_native_room_delete_releases_lobby_lock(self):
+        self.service.sync_lobby_locks = AsyncMock()
+        await self.service.on_guild_channel_delete(self.channel)
+        self.db.delete_semi_room.assert_awaited_once_with(1, 20)
+        self.service.sync_lobby_locks.assert_awaited_once_with(self.channel.guild)
 
     async def test_missing_semi_room_releases_slot(self):
         self.channel.guild.get_channel.return_value = None

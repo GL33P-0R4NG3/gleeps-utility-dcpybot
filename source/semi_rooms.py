@@ -10,9 +10,10 @@ from discord.ext import commands, tasks
 from room_permissions import visibility_overwrites
 from lobby_access import apply_lobby_gate, gate_role_id, may_create_room
 from room_help import RoomHelpView, welcome_embed
-from voice_channels import DELETE_DELAY, CHECK_INTERVAL, OWNER_PERMISSIONS
+from voice_channels import CHECK_INTERVAL, OWNER_PERMISSIONS
 
 log = logging.getLogger(__name__)
+HIDE_DELAY = 5 * 60
 
 
 class SemiRooms(commands.Cog):
@@ -201,7 +202,10 @@ class SemiRooms(commands.Cog):
                 # Also handles changed roles/manager permissions while hidden.
                 await self.set_visibility(channel, row["owner_id"], hidden=True)
             elif row["expires_at"] is None:
-                await self.db.update_semi_state(channel.id, hidden=False, expires_at=int(time.time()) + DELETE_DELAY)
+                await self.db.update_semi_state(channel.id, hidden=False, expires_at=int(time.time()) + HIDE_DELAY)
+            elif row["expires_at"] > int(time.time()) + HIDE_DELAY:
+                # Bound older 15-minute deadlines after upgrading the bot.
+                await self.db.update_semi_state(channel.id, hidden=False, expires_at=int(time.time()) + HIDE_DELAY)
             elif row["expires_at"] <= time.time():
                 await self.set_visibility(channel, row["owner_id"], hidden=True)
                 await self.db.update_semi_state(channel.id, hidden=True, expires_at=None)

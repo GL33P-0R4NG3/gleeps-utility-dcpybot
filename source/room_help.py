@@ -8,7 +8,7 @@ def welcome_embed():
         description=(
             "This room is yours. You can change its name, user limit and who is allowed to join. "
             "Your settings stay in place when the room hides — it isn't deleted.\n\n"
-            "After **15 minutes empty**, the room hides. You and people with **Manage Channel** "
+            "After **5 minutes empty**, the room hides. You and people with **Manage Channel** "
             "can still see it and reopen it by joining. Room managers also need permission to connect.\n\n"
             "When someone joins, the room becomes visible again. **Visibility doesn't grant access**: "
             "anyone without permission to connect still cannot join."
@@ -48,7 +48,7 @@ class RoomHelpView(discord.ui.View):
             "• **Recover your permissions:** `/room fix` restores your own missing Manage Channel permission. "
             "You can leave the channel field empty to find your private room automatically.\n"
             "• **Delete the room:** `/room delete` asks you to confirm first. Cancel or ignore the prompt to keep it.\n\n"
-            "After **15 minutes empty**, the room hides. Managers with join access can reopen it; "
+            "After **5 minutes empty**, the room hides. Managers with join access can reopen it; "
             "people with join-only access must wait until it is visible. Your settings stay in place. "
             "Server administrators retain their normal access.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
