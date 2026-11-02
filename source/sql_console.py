@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 
 
 class SQLModal(discord.ui.Modal, title="Bot database SQL console"):
-    statement = discord.ui.TextInput(label="One SQL statement (writes execute immediately)",
+    statement = discord.ui.TextInput(label="SQL statement (writes run immediately)",
                                     style=discord.TextStyle.paragraph, max_length=4000,
                                     placeholder="SELECT name, sql FROM sqlite_master WHERE type='table';")
 
