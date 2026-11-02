@@ -3,6 +3,12 @@ import discord
 
 # Channel-scoped only: never grant Administrator, Kick Members, or Ban Members.
 ROOM_PERMISSIONS = {name: True for name, allowed in discord.Permissions.all_channel() if allowed}
+# These also support voice-channel overwrites but are omitted by all_channel().
+ROOM_PERMISSIONS.update(create_events=True, manage_events=True, set_voice_channel_status=True,
+                        bypass_slowmode=True)
+# These also support voice-channel overwrites but are omitted by all_channel().
+ROOM_PERMISSIONS.update(create_events=True, manage_events=True, set_voice_channel_status=True,
+                        bypass_slowmode=True)
 ROOM_MEMBER_PERMISSIONS = (
     "send_messages", "read_message_history", "add_reactions", "embed_links",
     "attach_files", "external_emojis", "external_stickers", "send_voice_messages",
@@ -22,6 +28,8 @@ def apply_member_defaults(overwrite):
 ROOM_MODERATION_PERMISSIONS = (
     "manage_channels", "manage_permissions", "manage_messages", "manage_webhooks",
     "manage_threads", "mute_members", "deafen_members", "move_members",
+    "create_events", "manage_events", "set_voice_channel_status", "bypass_slowmode", "pin_messages",
+    "create_events", "manage_events", "set_voice_channel_status", "bypass_slowmode", "pin_messages",
 )
 
 

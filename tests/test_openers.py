@@ -238,6 +238,8 @@ class OpenerTests(unittest.IsolatedAsyncioTestCase):
         from room_permissions import ROOM_PERMISSIONS, ROOM_MODERATION_PERMISSIONS
         from voice_channels import OWNER_PERMISSIONS
         self.assertEqual(OWNER_PERMISSIONS, ROOM_PERMISSIONS)
+        for name in ("create_events", "manage_events", "set_voice_channel_status", "bypass_slowmode"):
+            self.assertTrue(ROOM_PERMISSIONS[name])
         await self.change(management=True, enabled=True)
         flags = self.channel.overwrites[self.guest]
         for name in ROOM_PERMISSIONS:
