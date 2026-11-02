@@ -30,6 +30,7 @@ class OpenerTests(unittest.IsolatedAsyncioTestCase):
         self.channel.guild.get_channel.return_value = self.channel
         async def edit(**kwargs):
             self.channel.overwrites = kwargs["overwrites"]
+            return self.channel
         self.channel.edit = AsyncMock(side_effect=edit)
         self.bot = Mock(db=self.db)
         self.bot.get_guild.return_value = self.channel.guild
@@ -46,6 +47,7 @@ class OpenerTests(unittest.IsolatedAsyncioTestCase):
         await self.change(opener=True, enabled=True)
         flags = self.channel.overwrites[self.guest]
         self.assertTrue(flags.connect)
+        self.assertTrue(flags.read_message_history)
         self.assertTrue(flags.view_channel)
         self.assertIsNone(flags.manage_channels)
         self.assertIsNone(flags.manage_permissions)
@@ -58,8 +60,10 @@ class OpenerTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_demotion_chain(self):
         await self.change(management=True, enabled=True)
         self.assertTrue(self.channel.overwrites[self.guest].manage_channels)
+        self.assertTrue(self.channel.overwrites[self.guest].move_members)
         await self.change(management=True, enabled=False)
         self.assertFalse(self.channel.overwrites[self.guest].manage_channels)
+        self.assertFalse(self.channel.overwrites[self.guest].move_members)
         self.assertTrue(self.channel.overwrites[self.guest].view_channel)
         self.assertIn(self.guest.id, await self.db.list_room_openers(1, 20))
         await self.change(opener=True, enabled=False)
@@ -198,6 +202,94 @@ class OpenerTests(unittest.IsolatedAsyncioTestCase):
              patch("room_commands.commands.RoleConverter.convert", new=AsyncMock(return_value=role)):
             result = await self.cog.parse_members(self.ctx, "<@12>, <@&2> <@12>")
         self.assertEqual(result, [self.guest, role])
+
+    async def test_remove_entry_preserves_inherited_access(self):
+        await self.change(opener=True, enabled=True)
+        self.guest.voice = Mock(channel=self.channel)
+        self.guest.move_to = AsyncMock()
+        self.channel.permissions_for.return_value = discord.Permissions(connect=True)
+        await self.change(enabled=False, remove_entry=True)
+        self.assertNotIn(self.guest, self.channel.overwrites)
+        self.assertEqual(await self.db.list_room_openers(1, 20), set())
+        self.guest.move_to.assert_not_awaited()
+        await self.service.set_visibility(self.channel, self.owner.id, hidden=True)
+        self.assertNotIn(self.guest, self.channel.overwrites)
+
+    async def test_remove_entry_does_not_disconnect_when_access_lost(self):
+        self.guest.voice = Mock(channel=self.channel)
+        self.guest.move_to = AsyncMock()
+        self.channel.permissions_for.return_value = discord.Permissions.none()
+        await self.change(enabled=False, remove_entry=True)
+        self.guest.move_to.assert_not_awaited()
+        self.assertNotIn(self.guest, self.channel.overwrites)
+
+    async def test_remove_role_keeps_personal_grants(self):
+        role = self.guest.roles[1]
+        role.members = [self.guest]
+        await self.change(opener=True, enabled=True)
+        await self.change([role], opener=True, enabled=True)
+        self.channel.permissions_for.return_value = discord.Permissions(connect=True)
+        await self.change([role], enabled=False, remove_entry=True)
+        self.assertNotIn(role, self.channel.overwrites)
+        self.assertTrue(self.channel.overwrites[self.guest].connect)
+        self.assertEqual(await self.db.list_room_openers(1, 20), {self.guest.id})
+
+    async def test_manager_full_channel_permissions_and_demotion(self):
+        from room_permissions import ROOM_PERMISSIONS, ROOM_MODERATION_PERMISSIONS
+        from voice_channels import OWNER_PERMISSIONS
+        self.assertEqual(OWNER_PERMISSIONS, ROOM_PERMISSIONS)
+        await self.change(management=True, enabled=True)
+        flags = self.channel.overwrites[self.guest]
+        for name in ROOM_PERMISSIONS:
+            self.assertTrue(getattr(flags, name), name)
+        for name in ("administrator", "kick_members", "ban_members", "manage_guild"):
+            self.assertIsNone(getattr(flags, name), name)
+        await self.change(management=True, enabled=False)
+        flags = self.channel.overwrites[self.guest]
+        for name in ROOM_MODERATION_PERMISSIONS:
+            self.assertFalse(getattr(flags, name), name)
+        self.assertTrue(flags.connect)
+
+    async def test_guests_and_openers_get_everyday_permissions_only(self):
+        from room_permissions import ROOM_MEMBER_PERMISSIONS, ROOM_MODERATION_PERMISSIONS
+        for opener in (False, True):
+            self.channel.overwrites[self.guest] = discord.PermissionOverwrite()
+            await self.change(enabled=True, opener=opener)
+            flags = self.channel.overwrites[self.guest]
+            for name in ROOM_MEMBER_PERMISSIONS:
+                self.assertTrue(getattr(flags, name), name)
+            for name in (*ROOM_MODERATION_PERMISSIONS, "mention_everyone", "create_instant_invite"):
+                self.assertIsNone(getattr(flags, name), name)
+
+    async def test_manual_media_denials_survive_add_hide_and_reveal(self):
+        flags = self.channel.overwrites[self.guest]
+        flags.attach_files = False
+        flags.use_soundboard = False
+        flags.read_message_history = False
+        await self.change(enabled=True)
+        await self.change(enabled=True, opener=True)
+        await self.service.set_visibility(self.channel, self.owner.id, hidden=True)
+        await self.service.set_visibility(self.channel, self.owner.id, hidden=False)
+        flags = self.channel.overwrites[self.guest]
+        self.assertFalse(flags.attach_files)
+        self.assertFalse(flags.use_soundboard)
+        self.assertFalse(flags.read_message_history)
+
+    async def test_visibility_uses_fresh_permissions_and_preserves_connect_states(self):
+        from copy import copy
+        for connect in (True, False, None):
+            stale = copy(self.channel)
+            stale.overwrites = {self.guest: discord.PermissionOverwrite(connect=None)}
+            self.channel.overwrites[self.guest].connect = connect
+            self.channel.overwrites[self.guest].attach_files = False
+            original = {target: value.pair() for target, value in self.channel.overwrites.items()}
+            view_bit = discord.Permissions(view_channel=True).value
+            for hidden in (True, False):
+                await self.service.set_visibility(stale, self.owner.id, hidden=hidden)
+                self.assertIs(self.channel.overwrites[self.guest].connect, connect)
+                for target, flags in self.channel.overwrites.items():
+                    self.assertEqual(tuple(p.value & ~view_bit for p in flags.pair()),
+                                     tuple(p.value & ~view_bit for p in original[target]))
 
 
 if __name__ == "__main__":

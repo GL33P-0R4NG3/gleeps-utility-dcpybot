@@ -25,7 +25,7 @@ class HybridCommandTests(unittest.IsolatedAsyncioTestCase):
                          {"help", "private", "fix", "manager", "opener", "user", "delete"})
         groups = {option["name"]: option for option in payloads["room"]["options"]}
         for name in ("manager", "opener", "user"):
-            self.assertEqual({item["name"] for item in groups[name]["options"]}, {"add", "remove"})
+            self.assertEqual({item["name"] for item in groups[name]["options"]}, ({"add", "remove", "deny"} if name == "user" else {"add", "remove"}))
         options = {option["name"]: option for option in payloads["setlobby"]["options"]}
         self.assertEqual(options["role"]["type"], discord.AppCommandOptionType.role.value)
         self.assertEqual(options["channel"]["type"], discord.AppCommandOptionType.channel.value)

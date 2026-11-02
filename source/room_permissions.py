@@ -1,6 +1,30 @@
 """Room-management checks independent of Discord's hidden-channel masking."""
 import discord
 
+# Channel-scoped only: never grant Administrator, Kick Members, or Ban Members.
+ROOM_PERMISSIONS = {name: True for name, allowed in discord.Permissions.all_channel() if allowed}
+ROOM_MEMBER_PERMISSIONS = (
+    "send_messages", "read_message_history", "add_reactions", "embed_links",
+    "attach_files", "external_emojis", "external_stickers", "send_voice_messages",
+    "send_polls", "send_messages_in_threads", "speak", "stream",
+    "use_voice_activation", "use_soundboard", "use_external_sounds",
+    "use_application_commands", "use_embedded_activities",
+)
+
+
+def apply_member_defaults(overwrite):
+    """Fill unspecified everyday permissions without undoing manual choices."""
+    for name in ROOM_MEMBER_PERMISSIONS:
+        if getattr(overwrite, name) is None:
+            setattr(overwrite, name, True)
+
+
+ROOM_MODERATION_PERMISSIONS = (
+    "manage_channels", "manage_permissions", "manage_messages", "manage_webhooks",
+    "manage_threads", "mute_members", "deafen_members", "move_members",
+)
+
+
 
 def can_manage_room(channel, member, owner_id, *, overwrites=None):
     return member.id == owner_id or has_manage_channels(channel, member, overwrites=overwrites)

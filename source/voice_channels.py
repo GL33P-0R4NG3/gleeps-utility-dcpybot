@@ -8,14 +8,12 @@ from weakref import WeakValueDictionary
 import discord
 from discord.ext import commands, tasks
 from lobby_access import may_create_room
+from room_permissions import ROOM_PERMISSIONS
 
 log = logging.getLogger(__name__)
 CHECK_INTERVAL = 60
 DELETE_DELAY = 15 * 60
-OWNER_PERMISSIONS = dict(speak=True, connect=True, view_channel=True,
-                         send_messages=True, manage_messages=True,
-                         manage_channels=True, manage_permissions=True,
-                         use_voice_activation=True)
+OWNER_PERMISSIONS = ROOM_PERMISSIONS
 
 
 class VoiceChannels(commands.Cog):

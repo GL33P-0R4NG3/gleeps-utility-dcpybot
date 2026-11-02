@@ -37,6 +37,7 @@ def permission_fixture():
     bot_member = Mock(spec=discord.Member, id=13, roles=[everyone], guild_permissions=discord.Permissions.none())
     guild = Mock(id=1, owner_id=999, default_role=everyone, me=bot_member, members=[owner, manager, guest, bot_member], unavailable=False)
     channel = Mock(spec=discord.VoiceChannel, id=20, guild=guild)
+    guild.fetch_channel = AsyncMock(return_value=channel)
     channel.overwrites = {
         everyone: discord.PermissionOverwrite(view_channel=True, connect=False, send_messages=False),
         access: discord.PermissionOverwrite(view_channel=True, connect=True),
@@ -665,7 +666,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             await cog.update_members(ctx, channel, [guest], management=False, enabled=True)
         channel.edit.assert_not_awaited()
 
-    async def test_user_remove_revokes_manager_and_disconnects(self):
+    async def test_user_deny_revokes_manager_without_disconnect(self):
         channel, owner, manager, guest, _ = permission_fixture()
         channel.guild.fetch_channel = AsyncMock(return_value=channel)
         channel.edit = AsyncMock()
@@ -685,8 +686,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(permissions.manage_channels)
         self.assertFalse(permissions.manage_permissions)
         self.assertFalse(permissions.view_channel)
-        manager.move_to.assert_awaited_once()
-        self.assertIsNone(manager.move_to.await_args.args[0])
+        manager.move_to.assert_not_awaited()
 
     async def test_member_list_deduplicates_and_rejects_unknown_member(self):
         cog = RoomCommands(Mock())
