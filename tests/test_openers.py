@@ -155,6 +155,50 @@ class OpenerTests(unittest.IsolatedAsyncioTestCase):
         self.channel.set_permissions.assert_not_awaited()
         self.assertIn("left this server", self.ctx.reply.await_args.args[0])
 
+    async def test_role_opener_reveals_existing_member_overwrite_after_restart(self):
+        role = self.guest.roles[1]
+        await self.change([role], opener=True, enabled=True)
+        restarted = SemiRooms(self.bot, DBHelper(self.db.path))
+        await restarted.set_visibility(self.channel, self.owner.id, hidden=True)
+        self.assertTrue(self.channel.overwrites[role].view_channel)
+        self.assertTrue(self.channel.overwrites[self.guest].view_channel)
+        self.assertIsNone(self.channel.overwrites[role].manage_channels)
+
+    async def test_role_removal_keeps_personal_access_and_does_not_disconnect(self):
+        role = self.guest.roles[1]
+        role.members = [self.guest]
+        await self.change(opener=True, enabled=True)
+        await self.change([role], management=True, enabled=True)
+        self.guest.voice = Mock(channel=self.channel)
+        self.guest.move_to = AsyncMock()
+        self.channel.permissions_for.return_value = discord.Permissions(connect=True)
+        await self.change([role], enabled=False)
+        self.assertFalse(self.channel.overwrites[role].connect)
+        self.assertTrue(self.channel.overwrites[self.guest].connect)
+        self.assertTrue(self.channel.overwrites[self.guest].view_channel)
+        self.assertEqual(await self.db.list_room_openers(1, 20), {self.guest.id})
+        self.guest.move_to.assert_not_awaited()
+
+    async def test_role_manager_demotion_chain(self):
+        role = self.guest.roles[1]
+        await self.change([role], management=True, enabled=True)
+        await self.change([role], opener=True, enabled=False)
+        self.assertTrue(self.channel.overwrites[role].manage_channels)
+        self.assertIn("Remove their manager permission first", self.ctx.reply.await_args.args[0])
+        await self.change([role], management=True, enabled=False)
+        self.assertIn(role.id, await self.db.list_room_openers(1, 20))
+        await self.change([role], opener=True, enabled=False)
+        self.assertTrue(self.channel.overwrites[role].connect)
+        self.assertFalse(self.channel.overwrites[role].view_channel)
+
+    async def test_mixed_member_role_mentions_deduplicated(self):
+        from unittest.mock import patch
+        role = self.guest.roles[1]
+        with patch("room_commands.commands.MemberConverter.convert", new=AsyncMock(return_value=self.guest)), \
+             patch("room_commands.commands.RoleConverter.convert", new=AsyncMock(return_value=role)):
+            result = await self.cog.parse_members(self.ctx, "<@12>, <@&2> <@12>")
+        self.assertEqual(result, [self.guest, role])
+
 
 if __name__ == "__main__":
     unittest.main()

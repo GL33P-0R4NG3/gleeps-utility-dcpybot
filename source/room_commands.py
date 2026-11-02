@@ -188,10 +188,16 @@ class RoomCommands(commands.Cog):
     async def parse_members(self, ctx, text):
         tokens = text.replace(",", " ").split()
         if not tokens or len(tokens) > 25:
-            raise commands.BadArgument("Mention between 1 and 25 members, separated by spaces or commas.")
+            raise commands.BadArgument("Mention between 1 and 25 members or roles, separated by spaces or commas.")
         members = {}
         for token in tokens:
-            member = await commands.MemberConverter().convert(ctx, token)
+            if token.startswith("<@&"):
+                member = await commands.RoleConverter().convert(ctx, token)
+            else:
+                try:
+                    member = await commands.MemberConverter().convert(ctx, token)
+                except commands.MemberNotFound:
+                    member = await commands.RoleConverter().convert(ctx, token)
             members[member.id] = member
         return list(members.values())
 
@@ -256,7 +262,13 @@ class RoomCommands(commands.Cog):
                     raise
         failed_disconnects = []
         if not management and not opener and not enabled:
-            for member in changed:
+            affected = {}
+            for target in changed:
+                candidates = target.members if isinstance(target, discord.Role) else [target]
+                for candidate in candidates:
+                    if not isinstance(target, discord.Role) or not current.permissions_for(candidate).connect:
+                        affected[candidate.id] = candidate
+            for member in affected.values():
                 if member.voice is not None and member.voice.channel == current:
                     try:
                         await member.move_to(None, reason=f"Room access removed by {ctx.author.id}")
@@ -265,16 +277,16 @@ class RoomCommands(commands.Cog):
                         log.exception("Removed room member could not be disconnected channel_id=%s member_id=%s",
                                       current.id, member.id)
         action = "Management" if management else "Opener access" if opener else "Join access" if enabled else "All room access"
-        text = f"{action} {'granted' if enabled else 'revoked'} for {len(changed)} member(s)."
+        text = f"{action} {'granted' if enabled else 'revoked'} for {len(changed)} member(s)/role(s)."
         if management and not enabled and changed:
             text += " They remain openers and can still open and join the room."
         elif opener and not enabled and changed:
             text += " They remain guests and can join while the room is visible."
         if skipped_managers:
-            names = ", ".join(f"<@{member.id}>" for member in skipped_managers)
+            names = ", ".join(f"<@&{member.id}>" if isinstance(member, discord.Role) else f"<@{member.id}>" for member in skipped_managers)
             text += f"\nSkipped {names}: they are room managers, which includes opener access. Remove their manager permission first, then remove opener access."
         if skipped_others:
-            text += "\nAlready without that permission: " + ", ".join(f"<@{member.id}>" for member in skipped_others) + "."
+            text += "\nAlready without that permission: " + ", ".join(f"<@&{member.id}>" if isinstance(member, discord.Role) else f"<@{member.id}>" for member in skipped_others) + "."
         if failed_disconnects:
             text += "\nAccess was revoked, but some members could not be disconnected. Check the bot's Move Members permission."
         await ctx.reply(text, allowed_mentions=discord.AllowedMentions.none())
@@ -287,14 +299,16 @@ class RoomCommands(commands.Cog):
 
     @manager.command(name="add")
     @commands.guild_only()
+    @discord.app_commands.describe(members="Members or roles: mentions separated by spaces or commas")
     async def manager_add(self, ctx, channel: discord.VoiceChannel, *, members: str):
-        """Grant listed members room management and join access."""
+        """Grant listed members or roles room management and join access."""
         await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=True, enabled=True)
 
     @manager.command(name="remove")
     @commands.guild_only()
+    @discord.app_commands.describe(members="Members or roles: mentions separated by spaces or commas")
     async def manager_remove(self, ctx, channel: discord.VoiceChannel, *, members: str):
-        """Remove management, leaving listed members as openers."""
+        """Remove management, leaving listed members or roles as openers."""
         await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=True, enabled=False)
 
     @room.group(name="opener", invoke_without_command=True)
@@ -305,12 +319,14 @@ class RoomCommands(commands.Cog):
 
     @opener.command(name="add")
     @commands.guild_only()
+    @discord.app_commands.describe(members="Members or roles: mentions separated by spaces or commas")
     async def opener_add(self, ctx, channel: discord.VoiceChannel, *, members: str):
         """Grant opening and joining without granting management."""
         await self.update_members(ctx, channel, await self.parse_members(ctx, members), opener=True, enabled=True)
 
     @opener.command(name="remove")
     @commands.guild_only()
+    @discord.app_commands.describe(members="Members or roles: mentions separated by spaces or commas")
     async def opener_remove(self, ctx, channel: discord.VoiceChannel, *, members: str):
         """Downgrade openers to guests; managers must be demoted first."""
         await self.update_members(ctx, channel, await self.parse_members(ctx, members), opener=True, enabled=False)
@@ -323,14 +339,16 @@ class RoomCommands(commands.Cog):
 
     @user.command(name="add")
     @commands.guild_only()
+    @discord.app_commands.describe(members="Members or roles: mentions separated by spaces or commas")
     async def user_add(self, ctx, channel: discord.VoiceChannel, *, members: str):
-        """Let listed members join without granting room management."""
+        """Let listed members or roles join without granting room management."""
         await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=False, enabled=True)
 
     @user.command(name="remove")
     @commands.guild_only()
+    @discord.app_commands.describe(members="Members or roles: mentions separated by spaces or commas")
     async def user_remove(self, ctx, channel: discord.VoiceChannel, *, members: str):
-        """Revoke joining, opening and management, and disconnect listed members."""
+        """Revoke joining, opening and management, and disconnect listed members or roles."""
         await self.update_members(ctx, channel, await self.parse_members(ctx, members), management=False, enabled=False)
 
     @room.command(name="delete")

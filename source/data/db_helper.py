@@ -547,6 +547,7 @@ class DBHelper:
             await db.commit()
 
     async def list_room_openers(self, guild_id: int, channel_id: int) -> set[int]:
+        # Legacy user_id column also stores role IDs; Discord snowflakes are globally unique.
         async with self.connect() as db:
             async with db.execute("SELECT user_id FROM room_openers WHERE guild_id=? AND channel_id=?",
                                   (guild_id, channel_id)) as cur:

@@ -18,7 +18,7 @@ def welcome_embed():
     embed.add_field(name="Who can join?", value=(
         "Only you have access initially (server administrators retain their normal access). "
         "Use `/room user add` to let people join, or "
-        "`/room opener add` to let them reopen it without management. Use `/room manager add` for full room management. Choose your room in the channel picker and mention the people you want to add. "
+        "`/room opener add` to let them reopen it without management. Use `/room manager add` for full room management. Choose your room in the channel picker and mention members or existing roles. "
         "No server roles are created."
     ), inline=False)
     embed.add_field(name="Need a hand?", value=(
@@ -38,7 +38,7 @@ class RoomHelpView(discord.ui.View):
         await interaction.response.send_message(
             "**Make this room your own**\n\n"
             "Choose a slash command, select your room in the **channel** picker, and mention one or more "
-            "people in **members**, separated by spaces. No channel IDs needed!\n\n"
+            "members or roles in **members**, separated by spaces. No channel IDs needed!\n\n"
             "**Guest → Opener → Manager**\n"
             "• `/room user add` — guests can join while the room is visible.\n"
             "• `/room opener add` — openers can see and join the hidden room to reveal it, without management rights.\n"

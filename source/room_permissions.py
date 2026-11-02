@@ -8,6 +8,16 @@ def can_manage_room(channel, member, owner_id, *, overwrites=None):
 
 def has_manage_channels(channel, member, *, overwrites=None):
     """Check actual management permissions without the stored-owner shortcut."""
+    if isinstance(member, discord.Role):
+        source = channel.overwrites if overwrites is None else overwrites
+        if member.permissions.administrator:
+            return True
+        allowed = member.permissions.manage_channels
+        for target in (channel.guild.default_role, member):
+            value = source.get(target, discord.PermissionOverwrite()).manage_channels
+            if value is not None:
+                allowed = value
+        return allowed
     if member.id == channel.guild.owner_id or member.guild_permissions.administrator:
         return True
     # permissions_for() strips channel permissions when View Channel is denied.
@@ -42,7 +52,8 @@ def visibility_overwrites(channel, owner_id, hidden, *, source_overwrites=None, 
             if target.id == owner_id or target.id in opener_ids or (channel.guild.me is not None and target.id == channel.guild.me.id):
                 visible = True
             elif isinstance(target, discord.Member):
-                visible = can_manage_room(channel, target, owner_id, overwrites=source)
+                visible = (can_manage_room(channel, target, owner_id, overwrites=source)
+                           or any(role.id in opener_ids for role in target.roles))
             elif isinstance(target, discord.Role):
                 # Resolve only this existing role's management grant. Never expand
                 # role membership into new per-member overwrites.
