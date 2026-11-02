@@ -117,6 +117,44 @@ class OpenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(text), 2000)
         self.assertIn("/room opener add", text)
 
+    async def test_opener_cannot_manage_room(self):
+        await self.change(opener=True, enabled=True)
+        self.ctx.author = self.guest
+        self.channel.edit.reset_mock()
+        from discord.ext import commands
+        with self.assertRaises(commands.CheckFailure):
+            await self.change(management=True, enabled=True)
+        self.channel.edit.assert_not_awaited()
+
+    async def test_server_admin_can_manage_hidden_room(self):
+        self.ctx.author = self.guest
+        self.guest.guild_permissions.administrator = True
+        await self.change([self.manager], management=False, enabled=True)
+        self.channel.edit.assert_awaited_once()
+        mode, row = await self.cog.managed_room(self.channel, self.guest)
+        self.assertEqual(row["owner_id"], self.owner.id)
+
+    async def test_admin_fix_repairs_owner_not_admin(self):
+        self.ctx.author = self.guest
+        self.guest.guild_permissions.administrator = True
+        self.channel.overwrites[self.owner].manage_channels = False
+        self.channel.guild.fetch_member = AsyncMock(return_value=self.owner)
+        self.channel.set_permissions = AsyncMock()
+        await self.cog.fix.callback(self.cog, self.ctx, self.channel)
+        self.channel.guild.fetch_member.assert_awaited_once_with(self.owner.id)
+        self.channel.set_permissions.assert_awaited_once()
+        self.assertIs(self.channel.set_permissions.await_args.args[0], self.owner)
+        self.assertTrue(self.channel.set_permissions.await_args.kwargs["overwrite"].manage_channels)
+
+    async def test_admin_fix_handles_departed_owner(self):
+        self.ctx.author = self.guest
+        self.guest.guild_permissions.administrator = True
+        self.channel.guild.fetch_member = AsyncMock(side_effect=discord_error())
+        self.channel.set_permissions = AsyncMock()
+        await self.cog.fix.callback(self.cog, self.ctx, self.channel)
+        self.channel.set_permissions.assert_not_awaited()
+        self.assertIn("left this server", self.ctx.reply.await_args.args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -100,11 +100,11 @@ class RoomCommands(commands.Cog):
         mode = "temporary"
         if row is None:
             row = await self.bot.db.get_semi_room(channel.guild.id, channel.id)
-            mode = "semi-temporary"
+            mode = "private"
         if row is None:
             raise commands.BadArgument("This channel is not a room managed by this bot.")
         if not can_manage_room(channel, member, row["owner_id"]):
-            raise commands.CheckFailure("Only the room owner or a member with room Manage Channels can do that.")
+            raise commands.CheckFailure("Only the room owner, room managers, or server administrators can do that.")
         return mode, row
 
     @commands.hybrid_group(name="room", invoke_without_command=True, fallback="help")
@@ -114,10 +114,10 @@ class RoomCommands(commands.Cog):
         """Create, manage, or delete bot-managed voice rooms."""
         await ctx.send_help(ctx.command)
 
-    @room.command(name="semi")
+    @room.command(name="private", aliases=["semi"])
     @commands.guild_only()
     async def semi(self, ctx, *, name: str):
-        """Create an owner-only room: g!room semi Room name. One per person."""
+        """Create an owner-only room: g!room private Room name. One per person."""
         service = self.bot.get_cog("SemiRooms")
         channel = await service.create_room(ctx.author, getattr(ctx.channel, "category", None), name)
         await ctx.reply(f"Your room is ready: {channel.mention}. "
@@ -127,19 +127,25 @@ class RoomCommands(commands.Cog):
     @room.command(name="fix")
     @commands.guild_only()
     async def fix(self, ctx, channel: Optional[discord.VoiceChannel] = None):
-        """Restore your room's Manage Channel permission: g!room fix [channel]."""
+        """Restore owner management; administrators can select another owner's room."""
         if channel is None:
-            # Works from any server text channel, even when the owner cannot see
-            # their room. Prefer their persistent room over their temporary one.
-            owned = [row for row in await self.bot.db.list_semi_rooms(ctx.guild.id)
-                     if row["owner_id"] == ctx.author.id]
-            if not owned:
-                owned = await self.bot.db.get_member_voice_channels(ctx.guild.id, ctx.author.id)
+            # Even administrators default only to their own rooms.
+            private = [dict(row, room_label="Private")
+                       for row in await self.bot.db.list_semi_rooms(ctx.guild.id)
+                       if row["owner_id"] == ctx.author.id]
+            temporary = [dict(row, room_label="Temporary") for row in
+                         await self.bot.db.get_member_voice_channels(ctx.guild.id, ctx.author.id)]
+            owned = private + temporary
             if not owned:
                 await ctx.reply("You don't own a room in this server yet.")
                 return
             if len(owned) != 1:
-                await ctx.reply("Please specify which room: `g!room fix <channel>`.")
+                choices = "\n".join(f"**{row['room_label']}**: <#{row['channel_id']}>" for row in owned)
+                await ctx.reply(
+                    "Which room would you like to repair?\n" + choices +
+                    "\nUse `/room fix` and select the room in **channel**, "
+                    "or use `g!room fix #room`.",
+                    allowed_mentions=discord.AllowedMentions.none())
                 return
             channel_id = owned[0]["channel_id"]
         else:
@@ -149,24 +155,34 @@ class RoomCommands(commands.Cog):
             row = await self.bot.db.get_semi_room(ctx.guild.id, channel_id)
             if row is None:
                 row = await self.bot.db.get_voice_channel(ctx.guild.id, channel_id)
-            if row is None or row["owner_id"] != ctx.author.id:
-                await ctx.reply("Only the recorded owner can repair this room's permissions.")
+            is_admin = ctx.author.id == ctx.guild.owner_id or ctx.author.guild_permissions.administrator
+            if row is None or (row["owner_id"] != ctx.author.id and not is_admin):
+                await ctx.reply("Only the recorded owner or a server administrator can repair this room's permissions.")
                 return
             try:
                 current = await ctx.guild.fetch_channel(channel_id)
             except discord.NotFound:
                 await ctx.reply("That room has been deleted, so there are no permissions to repair.")
                 return
-            if has_manage_channels(current, ctx.author):
-                await ctx.reply("You already have Manage Channel permission for that room. Nothing changed.")
+            owner = ctx.author
+            if row["owner_id"] != ctx.author.id:
+                try:
+                    owner = await ctx.guild.fetch_member(row["owner_id"])
+                except discord.NotFound:
+                    await ctx.reply("The recorded owner has left this server. No permissions were changed.")
+                    return
+            if has_manage_channels(current, owner):
+                await ctx.reply("You already have Manage Channel permission for that room. Nothing changed."
+                                if owner.id == ctx.author.id else
+                                "The owner already has Manage Channel permission. Nothing changed.")
                 return
-            overwrite = current.overwrites_for(ctx.author)
+            overwrite = current.overwrites_for(owner)
             overwrite.manage_channels = True
-            await current.set_permissions(ctx.author, overwrite=overwrite,
-                                          reason=f"Room owner {ctx.author.id} restored their management permission")
+            await current.set_permissions(owner, overwrite=overwrite,
+                                          reason=f"Owner management repaired by {ctx.author.id}")
         log.info("Owner management restored guild_id=%s channel_id=%s owner_id=%s",
-                 ctx.guild.id, channel_id, ctx.author.id)
-        await ctx.reply(f"Your Manage Channel permission for <#{channel_id}> is restored.",
+                 ctx.guild.id, channel_id, owner.id)
+        await ctx.reply(f"The owner's Manage Channel permission for <#{channel_id}> is restored.",
                         allowed_mentions=discord.AllowedMentions.none())
 
     async def parse_members(self, ctx, text):
@@ -227,7 +243,7 @@ class RoomCommands(commands.Cog):
                         openers.discard(member.id)
                 changed.append(member)
             if changed:
-                if mode == "semi-temporary":
+                if mode == "private":
                     overwrites = visibility_overwrites(current, row["owner_id"], bool(row["hidden"]),
                                                        source_overwrites=overwrites, opener_ids=openers)
                 # Keep persistence and the API edit consistent if Discord rejects it.

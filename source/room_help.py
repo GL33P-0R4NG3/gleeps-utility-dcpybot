@@ -47,7 +47,7 @@ class RoomHelpView(discord.ui.View):
             "• `/room opener remove` — downgrade openers to guests. Managers are skipped; remove their manager permission first.\n"
             "• `/room user remove` — remove all three permissions and disconnect them from the room.\n\n"
             "Open **Edit Channel** to change the name or user limit. Use `/room fix` if you accidentally "
-            "remove your own management permission; its channel field is optional. "
+            "remove your own management permission; with one room it is automatic; with both types, choose your Private or Temporary room. "
             "Use `/room delete` to delete the room with confirmation.\n\n"
             "After **5 minutes empty**, the room hides. Owners, openers and managers can reopen it; "
             "guests wait until it is visible. Your settings stay in place. "

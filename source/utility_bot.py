@@ -82,17 +82,17 @@ class AccessRoleConverter(commands.RoleConverter, discord.app_commands.Transform
 @discord.app_commands.guild_only()
 @discord.app_commands.default_permissions(manage_guild=True)
 @discord.app_commands.choices(mode=[discord.app_commands.Choice(name="Temporary", value="temp"),
-                                   discord.app_commands.Choice(name="Semi-temporary", value="semi")])
+                                   discord.app_commands.Choice(name="Private", value="semi")])
 @discord.app_commands.describe(mode="Room type", channel="Voice channel members join to create a room",
                                role="Existing role allowed to create rooms; omit to keep the gate (everyone for a new lobby)")
 @commands.guild_only()
 @commands.has_guild_permissions(manage_guild=True)
 async def set_lobby(ctx: commands.Context, mode: str, channel: discord.VoiceChannel,
                     role: AccessRoleConverter = None):
-    """Configure a lobby: g!setlobby temp|semi <channel> [@Role|everyone]."""
-    mode = {"temp": "temporary", "temporary": "temporary", "semi": "semi"}.get(mode.lower())
+    """Configure a lobby: g!setlobby temp|private <channel> [@Role|everyone]."""
+    mode = {"temp": "temporary", "temporary": "temporary", "semi": "semi", "private": "semi"}.get(mode.lower())
     if mode is None:
-        raise commands.BadArgument("Choose temp or semi as the lobby type.")
+        raise commands.BadArgument("Choose temp or private as the lobby type.")
     existing = await ctx.bot.db.get_lobby(ctx.guild.id, channel.id)
     if role is None:
         from lobby_access import gate_role_id
@@ -110,5 +110,5 @@ async def set_lobby(ctx: commands.Context, mode: str, channel: discord.VoiceChan
     log.info("Lobby configured guild_id=%s channel_id=%s mode=%s", ctx.guild.id, channel.id, mode)
     access = ("Everyone may enter this lobby and create a room." if role.is_default()
               else f"Only members with {role.mention} may enter this lobby and create a room.")
-    await ctx.reply(f"**{channel.name}** is now a {mode} room lobby. {access}",
+    await ctx.reply(f"**{channel.name}** is now a {'private' if mode == 'semi' else 'temporary'} room lobby. {access}",
                     allowed_mentions=discord.AllowedMentions.none())

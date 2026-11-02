@@ -60,7 +60,7 @@ class SemiRooms(commands.Cog):
                         continue
                 if source_lobby is not None:
                     return None  # Forced re-entry by an existing owner is deliberately a no-op.
-                raise commands.BadArgument(f"You already own a semi-temporary room: <#{row['channel_id']}>.")
+                raise commands.BadArgument(f"You already own a private room: <#{row['channel_id']}>.")
             if source_lobby is not None and (member.voice is None or member.voice.channel != source_lobby):
                 return None
             await self.db.get_settings_guild(guild.id)
@@ -74,7 +74,7 @@ class SemiRooms(commands.Cog):
                                                          manage_permissions=True, send_messages=True),
                 }
                 channel = await guild.create_voice_channel(name=name, category=category, overwrites=overwrites,
-                                                           reason=f"Semi-temporary room requested by {member.id}")
+                                                           reason=f"Private room requested by {member.id}")
                 await self.db.set_semi_room(guild.id, channel.id, member.id)
                 tracked = True
                 if source_lobby is not None:

@@ -464,7 +464,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         channel.set_permissions = AsyncMock()
         channel.guild.fetch_channel = AsyncMock(return_value=channel)
         row = {"owner_id": owner.id if owns else 9999, "channel_id": channel.id}
-        db = Mock(list_semi_rooms=AsyncMock(return_value=[row]), get_semi_room=AsyncMock(return_value=row))
+        db = Mock(list_semi_rooms=AsyncMock(return_value=[row]), get_semi_room=AsyncMock(return_value=row),
+                  get_member_voice_channels=AsyncMock(return_value=[]))
         bot = Mock(db=db)
         bot.get_cog.return_value = SemiRooms(bot, db)
         ctx = Mock(author=owner, guild=channel.guild, reply=AsyncMock())
@@ -485,6 +486,34 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await cog.fix.callback(cog, ctx)
         channel.set_permissions.assert_not_awaited()
         self.assertIn("already have", ctx.reply.await_args.args[0])
+
+    async def test_fix_both_room_types_asks_before_changing(self):
+        cog, ctx, channel = self.fix_fixture()
+        cog.bot.db.get_member_voice_channels.return_value = [{"owner_id": ctx.author.id, "channel_id": 21}]
+        await cog.fix.callback(cog, ctx)
+        text = ctx.reply.await_args.args[0]
+        self.assertIn("**Private**: <#20>", text)
+        self.assertIn("**Temporary**: <#21>", text)
+        channel.set_permissions.assert_not_awaited()
+        ctx.guild.fetch_channel.assert_not_awaited()
+
+    async def test_fix_admin_without_channel_only_considers_own_rooms(self):
+        cog, ctx, channel = self.fix_fixture()
+        ctx.author.guild_permissions.administrator = True
+        cog.bot.db.list_semi_rooms.return_value = [{"owner_id": 12345, "channel_id": 99}]
+        await cog.fix.callback(cog, ctx)
+        self.assertIn("don't own a room", ctx.reply.await_args.args[0])
+        ctx.guild.fetch_channel.assert_not_awaited()
+
+    async def test_fix_only_temporary_room_is_automatic(self):
+        cog, ctx, channel = self.fix_fixture()
+        row = {"owner_id": ctx.author.id, "channel_id": channel.id}
+        cog.bot.db.list_semi_rooms.return_value = []
+        cog.bot.db.get_semi_room.return_value = None
+        cog.bot.db.get_member_voice_channels.return_value = [row]
+        cog.bot.db.get_voice_channel = AsyncMock(return_value=row)
+        await cog.fix.callback(cog, ctx)
+        channel.set_permissions.assert_awaited_once()
 
     async def test_fix_rejects_non_owner_even_with_explicit_channel(self):
         cog, ctx, channel = self.fix_fixture(owns=False)
@@ -573,7 +602,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         bot.db.replace_room_openers = AsyncMock()
         bot.get_cog.return_value = service
         cog = RoomCommands(bot)
-        cog.managed_room = AsyncMock(return_value=("semi-temporary", {"owner_id": owner.id, "hidden": 1}))
+        cog.managed_room = AsyncMock(return_value=("private", {"owner_id": owner.id, "hidden": 1}))
         ctx = Mock(author=owner, guild=channel.guild, reply=AsyncMock())
         await cog.update_members(ctx, channel, [guest], management=True, enabled=True)
         channel.edit.assert_awaited_once()
@@ -597,7 +626,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         bot.db.replace_room_openers = AsyncMock()
         bot.get_cog.return_value = SemiRooms(bot, Mock())
         cog = RoomCommands(bot)
-        cog.managed_room = AsyncMock(return_value=("semi-temporary", {"owner_id": owner.id, "hidden": 1}))
+        cog.managed_room = AsyncMock(return_value=("private", {"owner_id": owner.id, "hidden": 1}))
         ctx = Mock(guild=channel.guild, author=owner, reply=AsyncMock())
         another = Mock(spec=discord.Member, id=40, roles=[], guild_permissions=discord.Permissions.none())
         channel.guild.members.append(another)
@@ -619,7 +648,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         bot.db.replace_room_openers = AsyncMock()
         bot.get_cog.return_value = SemiRooms(bot, Mock())
         cog = RoomCommands(bot)
-        cog.managed_room = AsyncMock(return_value=("semi-temporary", {"owner_id": owner.id, "hidden": 1}))
+        cog.managed_room = AsyncMock(return_value=("private", {"owner_id": owner.id, "hidden": 1}))
         ctx = Mock(guild=channel.guild, author=owner, reply=AsyncMock())
         await cog.update_members(ctx, channel, [manager, guest], management=True, enabled=True)
         values = channel.edit.await_args.kwargs["overwrites"]
@@ -648,7 +677,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         bot.db.replace_room_openers = AsyncMock()
         bot.get_cog.return_value = SemiRooms(bot, Mock())
         cog = RoomCommands(bot)
-        cog.managed_room = AsyncMock(return_value=("semi-temporary", {"owner_id": owner.id, "hidden": 1}))
+        cog.managed_room = AsyncMock(return_value=("private", {"owner_id": owner.id, "hidden": 1}))
         ctx = Mock(guild=channel.guild, author=owner, reply=AsyncMock())
         await cog.update_members(ctx, channel, [manager], management=False, enabled=False)
         permissions = channel.edit.await_args.kwargs["overwrites"][manager]
