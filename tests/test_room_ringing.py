@@ -46,6 +46,7 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         self.lobby.permissions_for.return_value = discord.Permissions.all()
         self.lobby.edit = AsyncMock()
         self.lobby.send = AsyncMock(return_value=Mock(id=201))
+        self.lobby.fetch_message = AsyncMock(return_value=Mock(id=201))
         self.lobby.delete = AsyncMock()
         self.guild.create_voice_channel = AsyncMock(return_value=self.lobby)
         self.channels = {20: self.room, 30: self.creation, 40: self.lobby}
@@ -225,6 +226,7 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         self.lobby.edit.assert_not_awaited()
 
     async def test_join_pings_in_lobby_without_dm_or_repeated_instructions(self):
+        await self.db.update_lobby_setting(1, 30, "RingHelpMessageID", 201)
         await self.service.on_voice_state_update(self.guest, Mock(channel=None), Mock(channel=self.lobby))
         self.guest.send.assert_not_awaited()
         self.lobby.send.assert_awaited_once()
@@ -232,6 +234,8 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args.args, (self.guest.mention,))
         self.assertEqual(args.kwargs["delete_after"], 60)
         self.assertEqual(args.kwargs["allowed_mentions"].users, [self.guest])
+        self.assertEqual(args.kwargs["reference"].message_id, 201)
+        self.assertFalse(args.kwargs["mention_author"])
         await self.service.on_voice_state_update(self.guest, Mock(channel=None), Mock(channel=self.lobby))
         self.lobby.send.assert_awaited_once()
 
@@ -362,6 +366,45 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         await request.decide(self.interaction(), allow=True)
         self.guest.move_to.assert_not_awaited()
         self.assertTrue(request.done)
+
+
+    async def test_occupant_can_accept_when_no_manager_is_present(self):
+        self.room.overwrites[self.manager.roles[-1]].manage_channels = False
+        self.room.members = [self.manager]
+        request = await self.request()
+        await request.decide(self.interaction(), allow=True)
+        self.guest.move_to.assert_awaited_once()
+
+    async def test_fallback_disappears_when_owner_joins_before_confirmation(self):
+        self.room.overwrites[self.manager.roles[-1]].manage_channels = False
+        self.room.members = [self.manager]
+        request = await self.request()
+        confirmation = DenyConfirmation(request, self.manager.id)
+        self.room.members.append(self.owner)
+        await confirmation.confirm.callback(self.interaction())
+        self.room.set_permissions.assert_not_awaited()
+        self.assertFalse(request.done)
+
+    async def test_non_occupant_cannot_use_fallback(self):
+        self.room.overwrites[self.manager.roles[-1]].manage_channels = False
+        self.room.members = [self.manager]
+        request = await self.request()
+        await request.decide(self.interaction(self.guest), allow=False)
+        self.assertFalse(request.done)
+
+    async def test_deleted_guide_is_replaced_and_recorded(self):
+        await self.db.update_lobby_setting(1, 30, "RingHelpMessageID", 100)
+        self.lobby.fetch_message.side_effect = discord_error(discord.NotFound)
+        guide = await self.service.usage_message(self.lobby)
+        self.assertEqual(guide.id, 201)
+        row = await self.db.get_lobby(1, 30)
+        self.assertEqual(row["settings_json"]["RingHelpMessageID"], 201)
+
+    async def test_existing_guide_is_reused_without_rewriting_user_wording(self):
+        await self.db.update_lobby_setting(1, 30, "RingHelpMessageID", 201)
+        await self.service.usage_message(self.lobby)
+        self.lobby.send.assert_not_awaited()
+        self.lobby.fetch_message.return_value.edit.assert_not_called()
 
 
 if __name__ == "__main__":
