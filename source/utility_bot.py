@@ -11,6 +11,7 @@ from room_commands import RoomCommands
 from sql_console import SQLConsole
 from room_help import RoomHelpView
 from lobby_access import apply_lobby_gate
+from room_ringing import RoomRinging
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class UtilityBot(commands.Bot):
         self.add_view(RoomHelpView())
         await self.add_cog(VoiceChannels(self, self.db))
         await self.add_cog(SemiRooms(self, self.db))
+        await self.add_cog(RoomRinging(self))
         await self.add_cog(RoomCommands(self))
         await self.add_cog(SQLConsole(self))
         self.add_command(set_lobby.copy())
@@ -84,15 +86,25 @@ class AccessRoleConverter(commands.RoleConverter, discord.app_commands.Transform
 @discord.app_commands.choices(mode=[discord.app_commands.Choice(name="Temporary", value="temp"),
                                    discord.app_commands.Choice(name="Private", value="semi")])
 @discord.app_commands.describe(mode="Room type", channel="Voice channel members join to create a room",
-                               role="Existing role allowed to create rooms; omit to keep the gate (everyone for a new lobby)")
+                               role="Existing role allowed to create rooms; omit to keep the gate (everyone for a new lobby)",
+                               lobbychannel="Public doorbell lobby for private rooms; omit to reuse or create 🛎️ Lobby")
 @commands.guild_only()
 @commands.has_guild_permissions(manage_guild=True)
 async def set_lobby(ctx: commands.Context, mode: str, channel: discord.VoiceChannel,
-                    role: AccessRoleConverter = None):
-    """Configure a lobby: g!setlobby temp|private <channel> [@Role|everyone]."""
+                    role: AccessRoleConverter = None, lobbychannel: discord.VoiceChannel = None):
+    """Configure a creation lobby, with an optional private-room doorbell lobby."""
     mode = {"temp": "temporary", "temporary": "temporary", "semi": "semi", "private": "semi"}.get(mode.lower())
     if mode is None:
         raise commands.BadArgument("Choose temp or private as the lobby type.")
+    if lobbychannel is not None and mode != "semi":
+        raise commands.BadArgument("A doorbell lobby is only used with Private mode.")
+    if lobbychannel is not None and lobbychannel.id == channel.id:
+        raise commands.BadArgument("The waiting lobby must be separate from the creation channel.")
+    configured = await ctx.bot.db.list_lobbies(ctx.guild.id)
+    if any(row["settings_json"].get("RingLobbyID") == channel.id for row in configured):
+        raise commands.BadArgument("That channel is a waiting lobby. Choose a separate creation channel.")
+    if mode == "semi":
+        await ctx.bot.get_cog("RoomRinging").validate_configuration(ctx.guild, channel, lobbychannel)
     existing = await ctx.bot.db.get_lobby(ctx.guild.id, channel.id)
     if role is None:
         from lobby_access import gate_role_id
@@ -105,10 +117,15 @@ async def set_lobby(ctx: commands.Context, mode: str, channel: discord.VoiceChan
         await ctx.bot.db.set_lobby(ctx.guild.id, channel.id, settings)
     await ctx.bot.db.update_lobby_setting(ctx.guild.id, channel.id, "RoomMode", mode)
     await ctx.bot.db.update_lobby_setting(ctx.guild.id, channel.id, "GateRoleID", role.id)
+    waiting = None
+    if mode == "semi":
+        waiting = await ctx.bot.get_cog("RoomRinging").configure(ctx.guild, channel, lobbychannel)
     await apply_lobby_gate(ctx.guild, channel.id, {"GateRoleID": role.id})
     await ctx.bot.get_cog("SemiRooms").sync_lobby_locks(ctx.guild)
     log.info("Lobby configured guild_id=%s channel_id=%s mode=%s", ctx.guild.id, channel.id, mode)
     access = ("Everyone may enter this lobby and create a room." if role.is_default()
               else f"Only members with {role.mention} may enter this lobby and create a room.")
+    if waiting is not None:
+        access += f" Visitors can wait in {waiting.mention} and use `/room ring`."
     await ctx.reply(f"**{channel.name}** is now a {'private' if mode == 'semi' else 'temporary'} room lobby. {access}",
                     allowed_mentions=discord.AllowedMentions.none())

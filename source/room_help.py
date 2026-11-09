@@ -50,6 +50,7 @@ class RoomHelpView(discord.ui.View):
             "Open **Edit Channel** to change the name or user limit. Use `/room fix` if you accidentally "
             "remove your own management permission; with one room it is automatic; with both types, choose your Private or Temporary room. "
             "Use `/room delete` to delete the room with confirmation.\n\n"
+            "Visitors can use `/room ring` from the waiting lobby. Owners/managers can Allow, Ignore or confirm Deny.\n\n"
             "After **5 minutes empty**, the room hides. Owners, openers and managers can reopen it; "
             "guests wait until it is visible. Your settings stay in place. "
             "No server roles are created, and server administrators retain their normal access.",

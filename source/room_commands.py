@@ -186,6 +186,23 @@ class RoomCommands(commands.Cog):
         await ctx.reply(f"The owner's Manage Channel permission for <#{channel_id}> is restored.",
                         allowed_mentions=discord.AllowedMentions.none())
 
+    @room.command(name="ring")
+    @commands.guild_only()
+    async def ring(self, ctx, channel: discord.VoiceChannel):
+        """From the waiting lobby, ask to join an occupied private room."""
+        try:
+            await self.bot.get_cog("RoomRinging").ring(ctx, channel)
+        except commands.CommandError as error:
+            await ctx.reply(str(error), ephemeral=True, delete_after=60,
+                            allowed_mentions=discord.AllowedMentions.none())
+        except discord.NotFound:
+            await ctx.reply("The room, lobby or member no longer exists. Please choose an available private room.",
+                            ephemeral=True, delete_after=60)
+        except discord.HTTPException:
+            log.exception("Doorbell request failed guild_id=%s channel_id=%s", ctx.guild.id, channel.id)
+            await ctx.reply("Discord couldn't deliver the ring. Check the bot's channel permissions and try again.",
+                            ephemeral=True, delete_after=60)
+
     async def parse_members(self, ctx, text):
         tokens = text.replace(",", " ").split()
         if not tokens or len(tokens) > 25:

@@ -105,6 +105,12 @@ class DBHelper:
                     PRIMARY KEY (guild_id, channel_id, user_id),
                     FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS ring_message_cleanup (
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER PRIMARY KEY,
+                    delete_at INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS semi_rooms (
                     guild_id INTEGER NOT NULL,
                     channel_id INTEGER PRIMARY KEY,
@@ -552,6 +558,23 @@ class DBHelper:
             async with db.execute("SELECT user_id FROM room_openers WHERE guild_id=? AND channel_id=?",
                                   (guild_id, channel_id)) as cur:
                 return {row[0] for row in await cur.fetchall()}
+
+    async def schedule_ring_cleanup(self, guild_id: int, channel_id: int, message_id: int, delete_at: int) -> None:
+        async with self.connect() as db:
+            await db.execute("INSERT INTO ring_message_cleanup VALUES (?,?,?,?) "
+                             "ON CONFLICT(message_id) DO UPDATE SET delete_at=excluded.delete_at",
+                             (guild_id, channel_id, message_id, delete_at))
+            await db.commit()
+
+    async def due_ring_messages(self, now: int) -> list[tuple[int, int, int]]:
+        async with self.connect() as db:
+            async with db.execute("SELECT guild_id,channel_id,message_id FROM ring_message_cleanup WHERE delete_at<=?", (now,)) as cursor:
+                return await cursor.fetchall()
+
+    async def delete_ring_cleanup(self, message_id: int) -> None:
+        async with self.connect() as db:
+            await db.execute("DELETE FROM ring_message_cleanup WHERE message_id=?", (message_id,))
+            await db.commit()
 
     async def replace_room_openers(self, guild_id: int, channel_id: int, user_ids: set[int]) -> None:
         """Replace a room's opener grants atomically; callers hold its room lock."""

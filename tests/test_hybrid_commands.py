@@ -22,13 +22,15 @@ class HybridCommandTests(unittest.IsolatedAsyncioTestCase):
         payloads = {cmd.name: cmd.to_dict(self.bot.tree) for cmd in self.bot.tree.get_commands()}
         self.assertEqual(set(payloads), {"room", "sql", "setlobby"})
         self.assertEqual({option["name"] for option in payloads["room"]["options"]},
-                         {"help", "private", "fix", "manager", "opener", "user", "delete"})
+                         {"help", "private", "fix", "manager", "opener", "user", "delete", "ring"})
         groups = {option["name"]: option for option in payloads["room"]["options"]}
         for name in ("manager", "opener", "user"):
             self.assertEqual({item["name"] for item in groups[name]["options"]}, ({"add", "remove", "deny"} if name == "user" else {"add", "remove"}))
         options = {option["name"]: option for option in payloads["setlobby"]["options"]}
         self.assertEqual(options["role"]["type"], discord.AppCommandOptionType.role.value)
         self.assertEqual(options["channel"]["type"], discord.AppCommandOptionType.channel.value)
+        self.assertEqual(options["lobbychannel"]["type"], discord.AppCommandOptionType.channel.value)
+        self.assertFalse(options["lobbychannel"].get("required", False))
         self.assertEqual({choice["value"] for choice in options["mode"]["choices"]}, {"temp", "semi"})
         for name in ("setlobby", "sql", "room fix", "room semi", "room manager add", "room manager remove", "room opener add", "room opener remove", "room user add", "room user remove", "room delete"):
             self.assertIsInstance(self.bot.get_command(name), commands.HybridCommand)

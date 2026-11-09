@@ -532,12 +532,15 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_lobby_command_order_and_everyone_converter(self):
         from utility_bot import set_lobby, AccessRoleConverter
-        self.assertEqual(list(set_lobby.clean_params), ["mode", "channel", "role"])
+        self.assertEqual(list(set_lobby.clean_params), ["mode", "channel", "role", "lobbychannel"])
         ctx = Mock()
         converter = AccessRoleConverter()
         self.assertIs(await converter.convert(ctx, "everyone"), ctx.guild.default_role)
         self.assertIs(await converter.convert(ctx, "@everyone"), ctx.guild.default_role)
         ctx.bot.db.get_lobby = AsyncMock(return_value={})
+        ctx.bot.db.list_lobbies = AsyncMock(return_value=[])
+        ctx.bot.get_cog.return_value.configure = AsyncMock(return_value=Mock(mention="#lobby"))
+        ctx.bot.get_cog.return_value.validate_configuration = AsyncMock()
         ctx.bot.db.update_lobby_setting = AsyncMock()
         ctx.bot.get_cog.return_value.sync_lobby_locks = AsyncMock()
         ctx.reply = AsyncMock()
@@ -558,6 +561,9 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         ctx.guild.get_role.return_value = role
         ctx.guild.create_role = AsyncMock()
         ctx.bot.db.get_lobby = AsyncMock(return_value={"settings_json": {"GateRoleID": 99}})
+        ctx.bot.db.list_lobbies = AsyncMock(return_value=[])
+        ctx.bot.get_cog.return_value.configure = AsyncMock(return_value=Mock(mention="#lobby"))
+        ctx.bot.get_cog.return_value.validate_configuration = AsyncMock()
         ctx.bot.db.update_lobby_setting = AsyncMock()
         ctx.bot.get_cog.return_value.sync_lobby_locks = AsyncMock()
         with patch("utility_bot.apply_lobby_gate", new=AsyncMock()):
