@@ -112,8 +112,8 @@ class RingRequest(discord.ui.View):
             if self.ctx.interaction is not None:
                 await private_reply(self.ctx.interaction, text)
             else:
-                await self.ctx.author.send(text, delete_after=REQUEST_TIMEOUT,
-                                           allowed_mentions=discord.AllowedMentions.none())
+                await self.ctx.reply(f"{self.ctx.author.mention} {text}", delete_after=REQUEST_TIMEOUT,
+                                     allowed_mentions=discord.AllowedMentions(users=[self.ctx.author], roles=False, everyone=False))
         except discord.HTTPException:
             log.info("Ring result could not be delivered requester_id=%s", self.requester_id)
 
@@ -342,8 +342,7 @@ class RoomRinging(commands.Cog):
                     await lobbychannel.delete(reason="Roll back unrecorded waiting lobby")
                 raise
             try:
-                message = await lobbychannel.send(LOBBY_HELP, delete_after=REQUEST_TIMEOUT, allowed_mentions=discord.AllowedMentions.none())
-                await self.bot.db.schedule_ring_cleanup(guild.id, lobbychannel.id, message.id, int(time.time()) + REQUEST_TIMEOUT)
+                await lobbychannel.send(LOBBY_HELP, allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 log.warning("Could not send waiting-lobby help channel_id=%s", lobbychannel.id)
             return lobbychannel
@@ -497,15 +496,12 @@ class RoomRinging(commands.Cog):
             event = SimpleNamespace(guild=member.guild, author=member)
             if self.prompts.get_bucket(event).update_rate_limit():
                 return
-            await member.send(LOBBY_HELP, delete_after=REQUEST_TIMEOUT, allowed_mentions=discord.AllowedMentions.none())
+            message = await after.channel.send(
+                member.mention, delete_after=60,
+                allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False))
+            await self.bot.db.schedule_ring_cleanup(member.guild.id, after.channel.id, message.id,
+                                                    int(time.time()) + 60)
         except discord.HTTPException:
-            log.info("Lobby DM unavailable member_id=%s; sending temporary lobby help", member.id)
-            try:
-                message = await after.channel.send(LOBBY_HELP, delete_after=REQUEST_TIMEOUT,
-                                                  allowed_mentions=discord.AllowedMentions.none())
-                await self.bot.db.schedule_ring_cleanup(member.guild.id, after.channel.id, message.id,
-                                                        int(time.time()) + REQUEST_TIMEOUT)
-            except discord.HTTPException:
-                log.info("Lobby help unavailable channel_id=%s", after.channel.id)
+            log.info("Lobby join ping unavailable channel_id=%s", after.channel.id)
         except Exception:
             log.exception("Doorbell lobby join failed member_id=%s", member.id)

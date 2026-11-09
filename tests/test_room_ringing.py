@@ -199,6 +199,8 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         self.lobby.overwrites = {self.guest: discord.PermissionOverwrite(connect=False, speak=False, manage_channels=True)}
         result = await self.service.configure(self.guild, self.creation)
         self.assertIs(result, self.lobby)
+        self.assertIn("/room ring", self.lobby.send.await_args.args[0])
+        self.assertNotIn("delete_after", self.lobby.send.await_args.kwargs)
         self.guild.create_voice_channel.assert_not_awaited()
         overwrites = self.lobby.edit.await_args.kwargs["overwrites"]
         for name in LOBBY_PERMISSIONS:
@@ -222,13 +224,16 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.configure(self.guild, self.creation, channel)
         self.lobby.edit.assert_not_awaited()
 
-    async def test_join_dm_and_blocked_dm(self):
-        self.guest.send.side_effect = discord_error(discord.Forbidden)
-        with self.assertLogs("room_ringing", level="INFO"):
-            await self.service.on_voice_state_update(self.guest, Mock(channel=None), Mock(channel=self.lobby))
-        self.guest.send.assert_awaited_once()
+    async def test_join_pings_in_lobby_without_dm_or_repeated_instructions(self):
         await self.service.on_voice_state_update(self.guest, Mock(channel=None), Mock(channel=self.lobby))
-        self.guest.send.assert_awaited_once()
+        self.guest.send.assert_not_awaited()
+        self.lobby.send.assert_awaited_once()
+        args = self.lobby.send.await_args
+        self.assertEqual(args.args, (self.guest.mention,))
+        self.assertEqual(args.kwargs["delete_after"], 60)
+        self.assertEqual(args.kwargs["allowed_mentions"].users, [self.guest])
+        await self.service.on_voice_state_update(self.guest, Mock(channel=None), Mock(channel=self.lobby))
+        self.lobby.send.assert_awaited_once()
 
     async def test_modal_payload_is_valid(self):
         modal = IgnoreReasonModal(RingRequest(self.service, self.ctx, 20, 40))
