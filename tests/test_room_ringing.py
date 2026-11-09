@@ -340,6 +340,24 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         await restarted.cleanup_messages()
         self.assertEqual(await self.db.due_ring_messages(1), [])
 
+    async def test_effective_join_access_rejects_ring_before_lower_priority_denies(self):
+        self.room.overwrites[self.role].connect = False
+        self.room.permissions_for.side_effect = lambda member: discord.Permissions(view_channel=True, connect=True)
+        with self.assertRaisesRegex(commands.BadArgument, "already have access.*join it directly"):
+            await self.service.ring(self.ctx, self.room)
+        self.room.send.assert_not_awaited()
+        self.assertFalse(self.service.pending)
+
+    async def test_admin_can_ring_for_testing_but_personal_denies_still_apply(self):
+        self.guest.guild_permissions.administrator = True
+        self.room.permissions_for.side_effect = lambda member: discord.Permissions.all()
+        request = await self.request()
+        self.assertFalse(request.done)
+        self.room.overwrites[self.guest].connect = False
+        await request.decide(self.interaction(), allow=True)
+        self.guest.move_to.assert_not_awaited()
+        self.assertTrue(request.done)
+
 
 if __name__ == "__main__":
     unittest.main()

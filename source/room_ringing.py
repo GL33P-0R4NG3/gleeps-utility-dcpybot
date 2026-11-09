@@ -393,6 +393,12 @@ class RoomRinging(commands.Cog):
                 break
         if not in_section:
             raise commands.BadArgument("That room is outside this lobby's private-room section.")
+        if member.is_timed_out():
+            raise commands.CheckFailure("You cannot ring rooms while timed out.")
+        # Administrators may ring for testing; other members use their effective access.
+        permissions = channel.permissions_for(member)
+        if permissions.view_channel and permissions.connect and not member.guild_permissions.administrator:
+            raise commands.BadArgument("You already have access to that room; you can join it directly.")
         personal = channel.overwrites_for(member)
         if personal.connect is False or personal.view_channel is False:
             raise commands.CheckFailure("This room explicitly denies your access. Ringing cannot bypass that restriction.")
@@ -405,10 +411,6 @@ class RoomRinging(commands.Cog):
                 raise commands.CheckFailure("One of your roles is explicitly restricted in this room.")
         if row["hidden"] or not any(not occupant.bot for occupant in channel.members):
             raise commands.BadArgument("That private room is inactive or empty. Try when someone is there.")
-        if member.is_timed_out():
-            raise commands.CheckFailure("You cannot ring rooms while timed out.")
-        if channel.permissions_for(member).connect:
-            raise commands.BadArgument("You already have access to that room; you can join it directly.")
         if channel.user_limit and len(channel.members) >= channel.user_limit:
             raise commands.BadArgument("That room is full. Try again when a place is available.")
         bot_permissions = channel.permissions_for(guild.me)
