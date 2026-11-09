@@ -407,5 +407,37 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         self.lobby.fetch_message.return_value.edit.assert_not_called()
 
 
+    async def test_ring_mentions_only_present_managers(self):
+        self.room.members = [self.manager]
+        await self.request()
+        sent = self.room.send.await_args
+        self.assertEqual(sent.args[0], self.manager.mention)
+        self.assertEqual([person.id for person in sent.kwargs["allowed_mentions"].users], [self.manager.id])
+
+    async def test_fallback_mentions_present_people_not_absent_owner_or_bots(self):
+        self.room.overwrites[self.manager.roles[-1]].manage_channels = False
+        self.guild.me.bot = True
+        self.room.members = [self.manager, self.guild.me]
+        await self.request()
+        sent = self.room.send.await_args
+        self.assertEqual(sent.args[0], self.manager.mention)
+        self.assertFalse(sent.kwargs["allowed_mentions"].everyone)
+        self.assertFalse(sent.kwargs["allowed_mentions"].roles)
+
+
+    async def test_large_fallback_pings_every_occupant_in_bounded_messages(self):
+        people = [Mock(spec=discord.Member, id=1000 + index, bot=False,
+                       guild_permissions=discord.Permissions.none(), roles=[self.guild.default_role])
+                  for index in range(82)]
+        self.room.members = people
+        self.room.send.side_effect = [Mock(id=200, edit=AsyncMock(), delete=AsyncMock()), Mock(id=202)]
+        await self.request()
+        pinged = set()
+        for call in self.room.send.await_args_list:
+            self.assertLessEqual(len(call.args[0]), 2000)
+            pinged.update(person.id for person in call.kwargs["allowed_mentions"].users)
+        self.assertEqual(pinged, {person.id for person in people})
+
+
 if __name__ == "__main__":
     unittest.main()

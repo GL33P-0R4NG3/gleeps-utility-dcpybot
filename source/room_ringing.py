@@ -16,7 +16,7 @@ LOBBY_PERMISSIONS = dict(view_channel=True, connect=True, send_messages=True,
                          use_voice_activation=True, use_application_commands=True)
 LOBBY_HELP = (
     "**🛎️ Ring a private room**\nWhile you are in this channel use `/room ring` and choose an occupied "
-    "private room. Someone will let you in shortly. You can stay here while you wait. You can chat, talk or stream in the meantime. "
+    "private room. Someone should let you in shortly. You can stay here while you wait. You can chat, talk or stream in the meantime. "
     "You need to wait 5 minutes before ringing that room again. "
 )
 
@@ -481,16 +481,25 @@ class RoomRinging(commands.Cog):
                 row = await self.bot.db.get_semi_room(ctx.guild.id, channel.id)
                 if row is None:
                     raise commands.BadArgument("That private room was removed. Please choose another room.")
-                recipients = {row["owner_id"]}
                 occupants = [person for person in channel.members if not person.bot]
                 present_managers = [person for person in occupants if can_manage_room(channel, person, row["owner_id"])]
-                recipients.update(person.id for person in (present_managers or occupants))
-                mentions = [discord.Object(id=user_id) for user_id in sorted(recipients)[:50]]
+                recipients = {person.id for person in (present_managers or occupants)}
+                mentions = [discord.Object(id=user_id) for user_id in sorted(recipients)]
                 request.message = await channel.send(
-                    " ".join(f"<@{person.id}>" for person in mentions), embed=embed, view=request,
-                    allowed_mentions=discord.AllowedMentions(users=mentions, roles=False, everyone=False))
+                    " ".join(f"<@{person.id}>" for person in mentions[:80]), embed=embed, view=request,
+                    allowed_mentions=discord.AllowedMentions(users=mentions[:80], roles=False, everyone=False))
                 await self.bot.db.schedule_ring_cleanup(ctx.guild.id, channel.id, request.message.id,
                                                         int(time.time()) + REQUEST_TIMEOUT + 10)
+                # Keep mentions within Discord's message and allowed-mentions limits.
+                for offset in range(80, len(mentions), 80):
+                    batch = mentions[offset:offset + 80]
+                    notification = await channel.send(
+                        " ".join(f"<@{person.id}>" for person in batch),
+                        reference=request.message, mention_author=False, delete_after=REQUEST_TIMEOUT,
+                        allowed_mentions=discord.AllowedMentions(users=batch, roles=False, everyone=False))
+                    await self.bot.db.schedule_ring_cleanup(ctx.guild.id, channel.id, notification.id,
+                                                            int(time.time()) + REQUEST_TIMEOUT)
+
             except Exception:
                 self.pending.pop(key, None)
                 request.stop()
