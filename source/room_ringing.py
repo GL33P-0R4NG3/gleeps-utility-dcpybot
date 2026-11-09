@@ -15,9 +15,9 @@ LOBBY_PERMISSIONS = dict(view_channel=True, connect=True, send_messages=True,
                          read_message_history=True, speak=True, stream=True,
                          use_voice_activation=True, use_application_commands=True)
 LOBBY_HELP = (
-    "**🛎️ Ring a private room**\nJoin this lobby, then use `/room ring` and choose an occupied "
-    "private room. Its owner or managers can let you in with one click. Stay here while you wait. "
-    "You can chat, talk or stream in the meantime. Unanswered requests are ignored after 1 minute. Wait 5 minutes after an ignored request before ringing that room again."
+    "**🛎️ Ring a private room**\nWhile you are in this channel use `/room ring` and choose an occupied "
+    "private room. Someone will let you in shortly. You can stay here while you wait. You can chat, talk or stream in the meantime. "
+    "You need to wait 5 minutes before ringing that room again. "
 )
 
 
@@ -103,8 +103,15 @@ class RingRequest(discord.ui.View):
         channel = await self.ctx.guild.fetch_channel(self.room_id)
         row = await self.service.bot.db.get_semi_room(self.ctx.guild.id, self.room_id)
         member = await self.ctx.guild.fetch_member(interaction.user.id)
-        if row is None or not can_manage_room(channel, member, row["owner_id"]):
-            raise commands.CheckFailure("Only this room's owner or managers can respond.")
+        if row is None:
+            raise commands.CheckFailure("This private room is no longer managed by the bot.")
+        if not can_manage_room(channel, member, row["owner_id"]):
+            occupants = [person for person in channel.members if not person.bot]
+            manager_present = any(can_manage_room(channel, person, row["owner_id"]) for person in occupants)
+            if manager_present or member.id not in {person.id for person in occupants}:
+                raise commands.CheckFailure(
+                    "Only the owner or managers can respond while one is in the room. "
+                    "Otherwise, someone currently in the room can respond.")
         return channel, member
 
     async def notify(self, text: str):
@@ -221,7 +228,7 @@ class RingRequest(discord.ui.View):
         try:
             await self.manager(interaction)
         except (commands.CommandError, discord.HTTPException):
-            await private_reply(interaction, "Only this room's owner or managers can deny this request.")
+            await private_reply(interaction, "You cannot respond to this request. An owner/manager, or a room occupant when none is present, must handle it.")
             return
         if self.done or time.monotonic() >= self.deadline:
             await private_reply(interaction, "This request has expired or was already handled.")
@@ -342,10 +349,31 @@ class RoomRinging(commands.Cog):
                     await lobbychannel.delete(reason="Roll back unrecorded waiting lobby")
                 raise
             try:
-                await lobbychannel.send(LOBBY_HELP, allowed_mentions=discord.AllowedMentions.none())
+                await self.usage_message(lobbychannel)
             except discord.HTTPException:
                 log.warning("Could not send waiting-lobby help channel_id=%s", lobbychannel.id)
             return lobbychannel
+
+    async def usage_message(self, lobbychannel):
+        """Reuse the recorded guide, preserving its wording; recreate it if deleted."""
+        guild = lobbychannel.guild
+        async with self.bot.get_cog("SemiRooms").lock(("ring-help", guild.id, lobbychannel.id)):
+            rows = [row for row in await self.bot.db.list_lobbies(guild.id)
+                    if row["settings_json"].get("RingLobbyID") == lobbychannel.id]
+            message = None
+            message_ids = {row["settings_json"].get("RingHelpMessageID") for row in rows}
+            for message_id in message_ids - {None}:
+                try:
+                    message = await lobbychannel.fetch_message(message_id)
+                    break
+                except discord.NotFound:
+                    continue
+            if message is None:
+                message = await lobbychannel.send(LOBBY_HELP, allowed_mentions=discord.AllowedMentions.none())
+            for row in rows:
+                if row["settings_json"].get("RingHelpMessageID") != message.id:
+                    await self.bot.db.update_lobby_setting(guild.id, row["lobby_id"], "RingHelpMessageID", message.id)
+            return message
 
     async def validate_configuration(self, guild, creation_channel, lobbychannel=None):
         """Reject conflicting channel roles before setlobby writes configuration."""
@@ -443,8 +471,9 @@ class RoomRinging(commands.Cog):
                 raise commands.BadArgument(f"Please wait {int(retry) + 1} seconds before ringing again.")
             request = RingRequest(self, ctx, channel.id, member.voice.channel.id)
             embed = discord.Embed(title="🛎️ Someone is at the door!", colour=discord.Colour.blurple(),
-                                  description=f"{member.mention} would like to join from {member.voice.channel.mention}.\n"
+                                  description=f"{member.mention} would like to join.\n"
                                   "Owner or managers: **Allow** to move them in, or **Ignore**. "
+                                  "If none is in the room, a current occupant can respond instead. "
                                   "**Deny** blocks future rings after confirmation. A reason is optional via **Ignore with reason**.")
             embed.set_footer(text="Expires in 1 minute. Approval is for this visit only. Requests do not survive a bot restart.")
             self.pending[key] = request
@@ -453,8 +482,9 @@ class RoomRinging(commands.Cog):
                 if row is None:
                     raise commands.BadArgument("That private room was removed. Please choose another room.")
                 recipients = {row["owner_id"]}
-                recipients.update(person.id for person in channel.members
-                                  if not person.bot and can_manage_room(channel, person, row["owner_id"]))
+                occupants = [person for person in channel.members if not person.bot]
+                present_managers = [person for person in occupants if can_manage_room(channel, person, row["owner_id"])]
+                recipients.update(person.id for person in (present_managers or occupants))
                 mentions = [discord.Object(id=user_id) for user_id in sorted(recipients)[:50]]
                 request.message = await channel.send(
                     " ".join(f"<@{person.id}>" for person in mentions), embed=embed, view=request,
@@ -496,8 +526,14 @@ class RoomRinging(commands.Cog):
             event = SimpleNamespace(guild=member.guild, author=member)
             if self.prompts.get_bucket(event).update_rate_limit():
                 return
+            try:
+                guide = await self.usage_message(after.channel)
+                reference = discord.MessageReference(message_id=guide.id, channel_id=after.channel.id,
+                                                       guild_id=member.guild.id, fail_if_not_exists=False)
+            except discord.HTTPException:
+                reference = None  # Still greet the member if the guide cannot be fetched.
             message = await after.channel.send(
-                member.mention, delete_after=60,
+                member.mention, delete_after=60, reference=reference, mention_author=False,
                 allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False))
             await self.bot.db.schedule_ring_cleanup(member.guild.id, after.channel.id, message.id,
                                                     int(time.time()) + 60)
