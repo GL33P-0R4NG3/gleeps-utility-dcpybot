@@ -10,7 +10,7 @@ import discord
 from discord.ext import commands
 
 from data.db_helper import DBHelper
-from room_ringing import RoomRinging, RingRequest, IgnoreReasonModal, DenyConfirmation, LOBBY_PERMISSIONS
+from room_ringing import RoomRinging, RingRequest, IgnoreReasonModal, RingConfirmation, LOBBY_PERMISSIONS
 from semi_rooms import SemiRooms
 from test_room_features import permission_fixture, discord_error
 
@@ -180,13 +180,13 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         await another.on_timeout()
         self.assertTrue(another.done)
 
-    async def test_duplicate_and_cooldown(self):
+    async def test_pending_blocks_duplicates_but_ignore_allows_new_ring(self):
         request = await self.request()
         with self.assertRaisesRegex(commands.BadArgument, "pending"):
             await self.service.ring(self.ctx, self.room)
         await request.decide(self.interaction(), allow=False)
-        with self.assertRaisesRegex(commands.BadArgument, "seconds"):
-            await self.service.ring(self.ctx, self.room)
+        await self.service.ring(self.ctx, self.room)
+        self.assertIsNot(self.service.pending[(1, self.guest.id, 20)], request)
 
     async def test_other_server_and_missing_bot_permissions(self):
         other = Mock(guild=Mock(id=2))
@@ -250,7 +250,7 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         request = await self.request()
         interaction = self.interaction()
         interaction.response.edit_message = AsyncMock()
-        confirmation = DenyConfirmation(request, self.manager.id)
+        confirmation = RingConfirmation(request, self.manager.id)
         await confirmation.cancel.callback(interaction)
         self.assertFalse(request.done)
         self.room.set_permissions.assert_not_awaited()
@@ -258,18 +258,18 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirmed_deny_blocks_future_rings_only_in_this_room(self):
         request = await self.request()
         original = dict(self.room.overwrites[self.guest])
-        confirmation = DenyConfirmation(request, self.manager.id)
+        confirmation = RingConfirmation(request, self.manager.id)
         await confirmation.confirm.callback(self.interaction())
         self.assertEqual(dict(self.room.overwrites[self.guest]), {**original, "connect": False})
         self.guest.move_to.assert_not_awaited()
         self.assertTrue(request.done)
         with self.assertRaisesRegex(commands.CheckFailure, "explicitly denies"):
             await self.service.validate(self.guest, self.room.id)
-        request.message.delete.assert_awaited_once_with(delay=10)
+        request.message.delete.assert_awaited_once_with(delay=0)
 
     async def test_confirmation_cannot_deny_after_another_manager_accepts(self):
         request = await self.request()
-        confirmation = DenyConfirmation(request, self.manager.id)
+        confirmation = RingConfirmation(request, self.manager.id)
         await request.decide(self.interaction(self.owner), allow=True)
         await confirmation.confirm.callback(self.interaction())
         self.room.set_permissions.assert_not_awaited()
@@ -277,30 +277,19 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirmation_rechecks_manager_permissions(self):
         request = await self.request()
-        confirmation = DenyConfirmation(request, self.manager.id)
+        confirmation = RingConfirmation(request, self.manager.id)
         self.room.overwrites[self.manager.roles[-1]].manage_channels = False
         await confirmation.confirm.callback(self.interaction())
         self.room.set_permissions.assert_not_awaited()
         self.assertFalse(request.done)
 
-    async def test_cooldown_is_five_minutes_per_person_per_room(self):
-        from types import SimpleNamespace
-        first = SimpleNamespace(guild=self.guild, author=self.guest, room_id=20)
-        other_room = SimpleNamespace(guild=self.guild, author=self.guest, room_id=21)
-        other_person = SimpleNamespace(guild=self.guild, author=self.manager, room_id=20)
-        self.assertIsNone(self.service.cooldowns.get_bucket(first, current=1000).update_rate_limit(current=1000))
-        self.assertEqual(self.service.cooldowns.get_bucket(first, current=1100).update_rate_limit(current=1100), 200)
-        self.assertIsNone(self.service.cooldowns.get_bucket(other_room, current=1100).update_rate_limit(current=1100))
-        self.assertIsNone(self.service.cooldowns.get_bucket(other_person, current=1100).update_rate_limit(current=1100))
-        self.assertIsNone(self.service.cooldowns.get_bucket(first, current=1301).update_rate_limit(current=1301))
-
     async def test_expiry_ignores_and_deletes_card(self):
         request = await self.request()
-        self.assertEqual(request.timeout, 60)
+        self.assertEqual(request.timeout, 300)
         await request.on_timeout()
         self.assertTrue(request.done)
         self.assertFalse(self.service.pending)
-        request.message.delete.assert_awaited_once_with(delay=10)
+        request.message.delete.assert_awaited_once_with(delay=0)
         self.assertIn("automatically ignored", self.ctx.interaction.followup.send.await_args.args[0])
 
     async def test_reason_submission_rechecks_manager(self):
@@ -325,17 +314,52 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item.disabled for item in request.children))
         self.guest.move_to.assert_not_awaited()
 
-    async def test_ignored_request_restarts_cooldown_from_dismissal(self):
-        from types import SimpleNamespace
+    async def test_expired_request_allows_another_ring(self):
         request = await self.request()
-        event = SimpleNamespace(guild=self.guild, author=self.guest, room_id=20)
-        bucket = self.service.cooldowns.get_bucket(event)
-        bucket._window -= 290
-        await request.decide(self.interaction(), allow=False)
-        self.assertGreater(self.service.cooldowns.get_bucket(event).get_retry_after(), 299)
-        with self.assertRaisesRegex(commands.BadArgument, "seconds"):
-            await self.service.ring(self.ctx, self.room)
+        request.deadline = 0
+        await self.service.ring(self.ctx, self.room)
+        self.assertTrue(request.done)
+        self.assertIsNot(self.service.pending[(1, self.guest.id, 20)], request)
 
+    async def test_add_guest_one_click_preserves_custom_permissions(self):
+        request = await self.request()
+        self.room.overwrites[self.guest].attach_files = False
+        await request.add_guest.callback(self.interaction())
+        self.assertEqual([button.label for button in request.children],
+                         ["Allow", "Ignore", "Deny", "Ignore with reason", "Add guest"])
+        overwrite = self.room.overwrites[self.guest]
+        self.assertTrue(overwrite.connect)
+        self.assertTrue(overwrite.view_channel)
+        self.assertTrue(overwrite.read_message_history)
+        self.assertFalse(overwrite.attach_files)
+        self.assertIsNot(overwrite.manage_channels, True)
+        self.guest.move_to.assert_awaited_once()
+        self.assertTrue(request.done)
+        self.assertFalse(self.service.pending)
+
+    async def test_add_guest_rechecks_manager_authorization(self):
+        request = await self.request()
+        self.room.overwrites[self.manager.roles[-1]].manage_channels = False
+        await request.add_guest.callback(self.interaction())
+        self.room.set_permissions.assert_not_awaited()
+        self.guest.move_to.assert_not_awaited()
+        self.assertFalse(request.done)
+
+    async def test_add_guest_failed_move_keeps_saved_access(self):
+        request = await self.request()
+        self.guest.move_to.side_effect = discord_error(discord.Forbidden)
+        await request.decide(self.interaction(), allow=True, add_guest=True)
+        self.assertTrue(self.room.overwrites[self.guest].connect)
+        self.assertTrue(request.done)
+        self.assertIn("join directly", self.ctx.interaction.followup.send.await_args.args[0])
+
+    async def test_add_guest_failed_permission_edit_stays_pending(self):
+        request = await self.request()
+        self.room.set_permissions.side_effect = discord_error(discord.Forbidden)
+        with self.assertLogs("room_ringing", level="ERROR"):
+            await request.decide(self.interaction(), allow=True, add_guest=True)
+        self.guest.move_to.assert_not_awaited()
+        self.assertFalse(request.done)
 
     async def test_cleanup_survives_restart_and_retries_discord_failure(self):
         await self.db.schedule_ring_cleanup(1, 20, 999, 0)
@@ -379,7 +403,7 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         self.room.overwrites[self.manager.roles[-1]].manage_channels = False
         self.room.members = [self.manager]
         request = await self.request()
-        confirmation = DenyConfirmation(request, self.manager.id)
+        confirmation = RingConfirmation(request, self.manager.id)
         self.room.members.append(self.owner)
         await confirmation.confirm.callback(self.interaction())
         self.room.set_permissions.assert_not_awaited()

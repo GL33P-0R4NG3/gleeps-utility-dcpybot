@@ -7,17 +7,17 @@ from types import SimpleNamespace
 import discord
 from discord.ext import commands, tasks
 
-from room_permissions import can_manage_room
+from room_permissions import can_manage_room, apply_member_defaults
 
 log = logging.getLogger(__name__)
-REQUEST_TIMEOUT = 60
+REQUEST_TIMEOUT = 5 * 60
 LOBBY_PERMISSIONS = dict(view_channel=True, connect=True, send_messages=True,
                          read_message_history=True, speak=True, stream=True,
                          use_voice_activation=True, use_application_commands=True)
 LOBBY_HELP = (
     "**🛎️ Ring a private room**\nWhile you are in this channel use `/room ring` and choose an occupied "
     "private room. Someone should let you in shortly. You can stay here while you wait. You can chat, talk or stream in the meantime. "
-    "You need to wait 5 minutes before ringing that room again. "
+    "You can ring again once your request is handled or expires after 5 minutes. "
 )
 
 
@@ -28,7 +28,7 @@ async def private_reply(interaction, text: str, *, view=None):
     return message
 
 
-class DenyConfirmation(discord.ui.View):
+class RingConfirmation(discord.ui.View):
     def __init__(self, request, actor_id: int):
         super().__init__(timeout=60)
         self.request = request
@@ -54,7 +54,7 @@ class DenyConfirmation(discord.ui.View):
     @discord.ui.button(label="Go back", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction, button):
         self.stop()
-        await interaction.response.edit_message(content="Cancelled. Use Allow, Ignore or Deny on the original request.", view=None)
+        await interaction.response.edit_message(content="Cancelled. Choose an action on the original request.", view=None)
         if self.message is not None:
             await self.message.delete(delay=10)
 
@@ -124,12 +124,7 @@ class RingRequest(discord.ui.View):
         except discord.HTTPException:
             log.info("Ring result could not be delivered requester_id=%s", self.requester_id)
 
-    async def finish(self, text: str, *, ignored: bool = False):
-        if ignored:
-            event = SimpleNamespace(guild=self.ctx.guild, author=self.ctx.author, room_id=self.room_id)
-            bucket = self.service.cooldowns.get_bucket(event)
-            bucket.reset()
-            bucket.update_rate_limit()
+    async def finish(self, text: str):
         self.done = True
         self.stop()
         if self.expiry_task is not None and self.expiry_task is not asyncio.current_task():
@@ -140,7 +135,7 @@ class RingRequest(discord.ui.View):
         if self.message is not None:
             try:
                 await self.service.bot.db.schedule_ring_cleanup(
-                    self.ctx.guild.id, self.room_id, self.message.id, int(time.time()) + 10)
+                    self.ctx.guild.id, self.room_id, self.message.id, int(time.time()))
             except Exception:
                 log.exception("Could not reschedule ring cleanup message_id=%s", self.message.id)
             try:
@@ -148,14 +143,14 @@ class RingRequest(discord.ui.View):
                                         allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 log.info("Ring card could not be updated room_id=%s", self.room_id)
-            await self.message.delete(delay=10)
+            await self.message.delete(delay=0)
 
-    async def decide(self, interaction, *, allow: bool, reason: str = "", block: bool = False):
+    async def decide(self, interaction, *, allow: bool, reason: str = "", block: bool = False, add_guest: bool = False):
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.lock:
             if self.done or time.monotonic() >= self.deadline:
                 if not self.done:
-                    await self.finish("Request expired. Automatically ignored after 1 minute.", ignored=True)
+                    await self.finish("Request expired. Automatically ignored after 5 minutes.")
                 await private_reply(interaction, "This request has expired or was already handled.")
                 return
             try:
@@ -188,8 +183,8 @@ class RingRequest(discord.ui.View):
                 await private_reply(interaction, "Connect denied for this person in this room. Future rings here are blocked.")
                 return
             if not allow:
-                text = "Your room request was ignored. Wait 5 minutes before ringing this room again." + (f" Reason: {reason}" if reason else "")
-                await self.finish(f"Request ignored by {manager.mention}.", ignored=True)
+                text = "Your room request was ignored. You can ring this room again now." + (f" Reason: {reason}" if reason else "")
+                await self.finish(f"Request ignored by {manager.mention}.")
                 await self.notify(text)
                 await private_reply(interaction, "Request ignored.")
                 return
@@ -199,7 +194,23 @@ class RingRequest(discord.ui.View):
                     channel = await self.service.validate(requester, self.room_id, expected_lobby=self.lobby_id)
                     # Recheck authorization under the same lock used by permission commands.
                     channel, manager = await self.manager(interaction)
-                    await self.service.admit(requester, channel, manager)
+                    if add_guest:
+                        overwrite = channel.overwrites_for(requester)
+                        apply_member_defaults(overwrite)
+                        overwrite.view_channel = True
+                        overwrite.connect = True
+                        await channel.set_permissions(requester, overwrite=overwrite,
+                                                      reason=f"Doorbell guest access granted by {manager.id}")
+                        # A failed move must not hide the successfully saved grant.
+                        try:
+                            await self.service.admit(requester, channel, manager)
+                        except discord.HTTPException:
+                            await self.finish("Guest access saved; automatic move failed.")
+                            await self.notify(f"You now have guest access to {channel.mention}. Please join directly; I couldn't move you.")
+                            await private_reply(interaction, "Guest access saved, but the move failed. They can join directly.")
+                            return
+                    else:
+                        await self.service.admit(requester, channel, manager)
             except (commands.CommandError, discord.NotFound) as error:
                 text = str(error) if isinstance(error, commands.CommandError) else "The room or requester no longer exists."
                 await self.finish("Request cancelled: " + text)
@@ -208,10 +219,11 @@ class RingRequest(discord.ui.View):
                 return
             except discord.HTTPException:
                 log.exception("Room admission failed room_id=%s requester_id=%s", self.room_id, self.requester_id)
-                await private_reply(interaction, "Discord refused the move. Check my Move Members and channel access permissions, then retry.")
+                await private_reply(interaction, "Discord refused the guest access update. Check my Manage Permissions access, then retry." if add_guest else "Discord refused the move. Check my Move Members and channel access permissions, then retry.")
                 return
             await self.finish(f"Request accepted by {manager.mention}.")
-            await self.notify(f"Your request was accepted. You were moved to {channel.mention}.")
+            await self.notify(f"Your request was accepted. You were moved to {channel.mention}."
+                              + (" You also have regular guest access now." if add_guest else ""))
             await private_reply(interaction, "Accepted and moved into the room.")
 
     @discord.ui.button(label="Allow", style=discord.ButtonStyle.success)
@@ -233,7 +245,7 @@ class RingRequest(discord.ui.View):
         if self.done or time.monotonic() >= self.deadline:
             await private_reply(interaction, "This request has expired or was already handled.")
             return
-        view = DenyConfirmation(self, interaction.user.id)
+        view = RingConfirmation(self, interaction.user.id)
         view.message = await private_reply(
             interaction, "Deny this person access to this room? This sets an explicit Connect deny and blocks future rings here. "
             "Go back to keep the request active.", view=view)
@@ -247,18 +259,21 @@ class RingRequest(discord.ui.View):
             return
         await interaction.response.send_modal(IgnoreReasonModal(self))
 
+    @discord.ui.button(label="Add guest", style=discord.ButtonStyle.success)
+    async def add_guest(self, interaction, button):
+        await self.decide(interaction, allow=True, add_guest=True)
+
     async def on_timeout(self):
         async with self.lock:
             if not self.done:
-                await self.finish("Request expired. Automatically ignored after 1 minute.", ignored=True)
-                await self.notify("Your room request was automatically ignored. Wait 5 minutes before ringing this room again.")
+                await self.finish("Request expired. Automatically ignored after 5 minutes.")
+                await self.notify("Your room request was automatically ignored. You can ring this room again now.")
 
 
 class RoomRinging(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.pending: dict[tuple[int, int, int], RingRequest] = {}
-        self.cooldowns = commands.CooldownMapping.from_cooldown(1, 300, lambda event: (event.guild.id, event.author.id, event.room_id))
         self.prompts = commands.CooldownMapping.from_cooldown(1, 60, commands.BucketType.member)
 
     def room_lock(self, room_id: int):
@@ -460,22 +475,18 @@ class RoomRinging(commands.Cog):
             if previous is not None and time.monotonic() >= previous.deadline:
                 await previous.on_timeout()
             if key in self.pending:
-                raise commands.BadArgument("You already have a pending ring for this room. Wait for a response or its 1-minute expiry.")
+                raise commands.BadArgument("You already have a pending ring for this room. Wait for a response or its 5-minute expiry.")
             member = await ctx.guild.fetch_member(ctx.author.id)
             channel = await self.validate(member, channel.id)
             if sum(request.room_id == channel.id for request in self.pending.values()) >= 5:
                 raise commands.BadArgument("That room already has several requests waiting. Please try later.")
-            event = SimpleNamespace(guild=ctx.guild, author=ctx.author, room_id=channel.id)
-            retry = self.cooldowns.get_bucket(event).update_rate_limit()
-            if retry:
-                raise commands.BadArgument(f"Please wait {int(retry) + 1} seconds before ringing again.")
             request = RingRequest(self, ctx, channel.id, member.voice.channel.id)
             embed = discord.Embed(title="🛎️ Someone is at the door!", colour=discord.Colour.blurple(),
                                   description=f"{member.mention} would like to join.\n"
                                   "Owner or managers: **Allow** to move them in, or **Ignore**. "
                                   "If none is in the room, a current occupant can respond instead. "
-                                  "**Deny** blocks future rings after confirmation. A reason is optional via **Ignore with reason**.")
-            embed.set_footer(text="Expires in 1 minute. Approval is for this visit only. Requests do not survive a bot restart.")
+                                  "**Add guest** grants regular access and moves them in. **Deny** blocks future rings after confirmation. A reason is optional via **Ignore with reason**.")
+            embed.set_footer(text="Expires in 5 minutes. Allow is for this visit only; Add guest saves access. Requests do not survive a bot restart.")
             self.pending[key] = request
             try:
                 row = await self.bot.db.get_semi_room(ctx.guild.id, channel.id)
