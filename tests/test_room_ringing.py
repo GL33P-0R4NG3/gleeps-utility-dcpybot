@@ -84,6 +84,27 @@ class RingingTests(unittest.IsolatedAsyncioTestCase):
         await self.service.ring(self.ctx, self.room)
         return self.service.pending[(1, self.guest.id, self.room.id)]
 
+    async def test_ignore_plain_replies_omit_none_view(self):
+        request = await self.request()
+        interaction = self.interaction()
+        async def strict_send(*args, **kwargs):
+            if "view" in kwargs and kwargs["view"] is None:
+                raise TypeError("Webhook.send does not accept view=None")
+            return Mock(delete=AsyncMock())
+        interaction.followup.send.side_effect = strict_send
+        self.ctx.interaction.followup.send.side_effect = strict_send
+        await request.ignore.callback(interaction)
+        self.assertTrue(request.done)
+        self.assertEqual(interaction.followup.send.await_args.args[0], "Request ignored.")
+
+    async def test_outsider_ignore_returns_refusal(self):
+        request = await self.request()
+        interaction = self.interaction(self.guest)
+        await request.ignore.callback(interaction)
+        self.assertFalse(request.done)
+        self.assertNotIn("view", interaction.followup.send.await_args.kwargs)
+        self.assertIn("Only the owner or managers", interaction.followup.send.await_args.args[0])
+
     async def test_validation_rejects_wrong_lobby_target_and_section(self):
         with self.assertRaisesRegex(commands.BadArgument, "lobby or a room-creation"):
             await self.service.validate(self.guest, 30)

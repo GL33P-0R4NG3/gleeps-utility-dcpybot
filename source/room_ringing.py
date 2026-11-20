@@ -22,8 +22,10 @@ LOBBY_HELP = (
 
 
 async def private_reply(interaction, text: str, *, view=None):
-    message = await interaction.followup.send(text, ephemeral=True, view=view, wait=True,
-                                             allowed_mentions=discord.AllowedMentions.none())
+    # Webhook.send rejects an explicit None view; omit it for plain replies.
+    options = {"view": view} if view is not None else {}
+    message = await interaction.followup.send(text, ephemeral=True, wait=True,
+                                             allowed_mentions=discord.AllowedMentions.none(), **options)
     await message.delete(delay=REQUEST_TIMEOUT)
     return message
 
