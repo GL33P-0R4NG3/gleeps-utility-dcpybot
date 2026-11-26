@@ -8,7 +8,7 @@ from weakref import WeakValueDictionary
 import discord
 from discord.ext import commands, tasks
 from lobby_access import may_create_room
-from room_permissions import ROOM_PERMISSIONS
+from room_permissions import ROOM_PERMISSIONS, room_is_occupied
 
 log = logging.getLogger(__name__)
 CHECK_INTERVAL = 60
@@ -46,7 +46,10 @@ class VoiceChannels(commands.Cog):
                 try:
                     row = await self.db.get_voice_channel(member.guild.id, channel.id)
                     if row:
-                        expiry = None if channel.voice_states else int(time.time()) + DELETE_DELAY
+                        occupied = room_is_occupied(channel)
+                        if not occupied and row.get("last_dc_time") is not None:
+                            continue
+                        expiry = None if occupied else int(time.time()) + DELETE_DELAY
                         await self.db.update_voice_last_disconnect(member.guild.id, channel.id, expiry)
                 except Exception:
                     log.exception("Voice state reconciliation failed guild_id=%s channel_id=%s", member.guild.id, channel.id)
@@ -178,7 +181,7 @@ class VoiceChannels(commands.Cog):
         if not isinstance(channel, discord.VoiceChannel):
             log.warning("Tracked channel is not a voice channel guild_id=%s channel_id=%s", guild_id, channel_id)
             return
-        if channel.voice_states:
+        if room_is_occupied(channel):
             if expiry is not None:
                 await self.db.update_voice_last_disconnect(guild_id, channel_id)
             return
@@ -204,7 +207,7 @@ class VoiceChannels(commands.Cog):
             }
             await self.db.set_settings_user(guild_id, lobby_id, owner_id, saved)
         # A member may join during the database await above.
-        if channel.voice_states:
+        if room_is_occupied(channel):
             await self.db.update_voice_last_disconnect(guild_id, channel_id)
             return
         try:

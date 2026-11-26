@@ -414,6 +414,17 @@ class SemiRoomLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(values["hidden"])
         self.channel.delete.assert_not_awaited()
 
+    async def test_bot_only_room_disconnects_at_expiry(self):
+        bot_member = Mock(bot=True, move_to=AsyncMock())
+        self.channel.guild.get_member.return_value = bot_member
+        self.channel.voice_states = {321: object()}
+        await self.service.reconcile_room(self.row)
+        bot_member.move_to.assert_not_awaited()
+        self.row["expires_at"] = 1
+        await self.service.reconcile_room(self.row)
+        bot_member.move_to.assert_awaited_once_with(None, reason="Private room is idle")
+        self.db.update_semi_state.assert_awaited_with(20, hidden=True, expires_at=None)
+
     async def test_expired_room_hides_and_preserves_connect(self):
         self.row["expires_at"] = int(time.time()) - 1
         await self.service.reconcile_room(self.row)

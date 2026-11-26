@@ -100,3 +100,12 @@ def visibility_overwrites(channel, owner_id, hidden, *, source_overwrites=None, 
                 visible = overwrite.manage_channels is True
         overwrite.view_channel = visible
     return overwrites
+
+
+def room_is_occupied(channel):
+    """Treat unknown occupants as people until the member cache identifies them."""
+    for member_id in channel.voice_states:
+        member = channel.guild.get_member(member_id)
+        if member is None or member.bot is not True:
+            return True
+    return False

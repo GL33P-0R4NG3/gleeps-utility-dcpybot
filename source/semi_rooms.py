@@ -7,7 +7,7 @@ from weakref import WeakValueDictionary
 import discord
 from discord.ext import commands, tasks
 
-from room_permissions import visibility_overwrites
+from room_permissions import visibility_overwrites, room_is_occupied
 from lobby_access import apply_lobby_gate, gate_role_id, may_create_room
 from room_help import RoomHelpView, welcome_embed
 from voice_channels import CHECK_INTERVAL, OWNER_PERMISSIONS
@@ -102,7 +102,7 @@ class SemiRooms(commands.Cog):
                 raise
             # Creation is complete. A visibility failure is retryable by reconciliation.
             try:
-                await self.set_visibility(channel, member.id, hidden=not bool(channel.voice_states))
+                await self.set_visibility(channel, member.id, hidden=not room_is_occupied(channel))
             except discord.HTTPException:
                 log.exception("Initial hidden-room visibility needs retry channel_id=%s", channel.id)
             log.info("Private room created guild_id=%s channel_id=%s owner_id=%s", guild.id, channel.id, member.id)
@@ -199,7 +199,17 @@ class SemiRooms(commands.Cog):
                     return
             if not isinstance(channel, discord.VoiceChannel):
                 return
-            if channel.voice_states:
+            if row["hidden"] or (row["expires_at"] is not None and row["expires_at"] <= time.time()):
+                for member_id in tuple(channel.voice_states):
+                    if room_is_occupied(channel):
+                        break
+                    member = guild.get_member(member_id)
+                    if member and member.bot and member_id in channel.voice_states:
+                        try:
+                            await member.move_to(None, reason="Private room is idle")
+                        except discord.HTTPException:
+                            log.warning("Could not disconnect idle bot member_id=%s room_id=%s", member_id, channel.id)
+            if room_is_occupied(channel):
                 await self.set_visibility(channel, row["owner_id"], hidden=False)
                 await self.db.update_semi_state(channel.id, hidden=False, expires_at=None)
             elif row["hidden"]:

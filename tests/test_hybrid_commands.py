@@ -20,7 +20,8 @@ class HybridCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tree_contains_every_custom_command(self):
         payloads = {cmd.name: cmd.to_dict(self.bot.tree) for cmd in self.bot.tree.get_commands()}
-        self.assertEqual(set(payloads), {"room", "sql", "setlobby"})
+        self.assertEqual(set(payloads), {"room", "sql", "setlobby", "afk"})
+        self.assertEqual({item["name"] for item in payloads["afk"]["options"]}, {"join", "leave"})
         self.assertEqual({option["name"] for option in payloads["room"]["options"]},
                          {"help", "private", "fix", "manager", "opener", "user", "delete", "ring"})
         groups = {option["name"]: option for option in payloads["room"]["options"]}

@@ -12,6 +12,7 @@ from sql_console import SQLConsole
 from room_help import RoomHelpView
 from lobby_access import apply_lobby_gate
 from room_ringing import RoomRinging
+from idle_voice import IdleVoice
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class UtilityBot(commands.Bot):
         await self.add_cog(RoomRinging(self))
         await self.add_cog(RoomCommands(self))
         await self.add_cog(SQLConsole(self))
+        await self.add_cog(IdleVoice())
         self.add_command(set_lobby.copy())
         synced = await self.tree.sync()
         log.info("Slash commands registered count=%s", len(synced))
