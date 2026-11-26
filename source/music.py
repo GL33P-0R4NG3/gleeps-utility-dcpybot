@@ -114,6 +114,18 @@ def stream_track(video_id, format_id):
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
+async def wait_for_voice_encryption(voice, timeout=15):
+    # discord.py 2.7 checks this same internal state when encrypting an Opus frame.
+    connection = voice._connection
+    try:
+        async with asyncio.timeout(timeout):
+            while voice.is_connected() and connection.dave_protocol_version and not connection.can_encrypt:
+                await asyncio.sleep(0.1)
+    except TimeoutError:
+        return False
+    return voice.is_connected()
+
+
 def log_voice_state(phase, voice, source):
     # discord.py 2.7 exposes DAVE readiness on its connection, not on VoiceClient.
     connection = getattr(voice, "_connection", None)
@@ -193,6 +205,11 @@ class Music(commands.Cog):
                 if not await asyncio.wait_for(asyncio.to_thread(source.prime), 25):
                     source.cleanup()
                     await ctx.reply("FFmpeg received no playable audio from YouTube.")
+                    return
+                if not await wait_for_voice_encryption(voice):
+                    log_voice_state("encryption-unavailable", voice, source)
+                    source.cleanup()
+                    await ctx.reply("The voice session did not become ready for playback. Please try again.")
                     return
                 log_voice_state("start", voice, source)
                 voice.play(source, after=lambda error: loop.call_soon_threadsafe(finish, error))

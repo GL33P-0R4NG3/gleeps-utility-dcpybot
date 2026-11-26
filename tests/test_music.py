@@ -10,10 +10,25 @@ import discord
 from discord.ext import commands
 from data.db_helper import DBHelper
 from idle_voice import IdleVoice
-from music import Music, resolve_track, youtube_query
+from music import Music, resolve_track, youtube_query, wait_for_voice_encryption
 
 
 class MusicTests(unittest.IsolatedAsyncioTestCase):
+    async def test_voice_encryption_gate(self):
+        voice = Mock()
+        voice.is_connected.return_value = True
+        connection = voice._connection
+        connection.dave_protocol_version = 1
+        connection.can_encrypt = False
+        self.assertFalse(await wait_for_voice_encryption(voice, timeout=0))
+        asyncio.get_running_loop().call_soon(setattr, connection, "can_encrypt", True)
+        self.assertTrue(await wait_for_voice_encryption(voice))
+        connection.dave_protocol_version = 0
+        connection.can_encrypt = False
+        self.assertTrue(await wait_for_voice_encryption(voice))
+        voice.is_connected.return_value = False
+        self.assertFalse(await wait_for_voice_encryption(voice))
+
     def test_inputs(self):
         self.assertEqual(youtube_query("some song"), "ytsearch1:some song")
         self.assertEqual(youtube_query("https://youtu.be/dQw4w9WgXcQ?t=30"),
