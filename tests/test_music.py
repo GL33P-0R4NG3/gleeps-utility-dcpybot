@@ -10,7 +10,7 @@ import discord
 from discord.ext import commands
 from data.db_helper import DBHelper
 from idle_voice import IdleVoice
-from music import Music, youtube_query
+from music import Music, resolve_track, youtube_query
 
 
 class MusicTests(unittest.IsolatedAsyncioTestCase):
@@ -20,6 +20,39 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
                          "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         with self.assertRaises(commands.BadArgument):
             youtube_query("https://example.org/video")
+
+    async def test_extractor_error_is_distinct_from_empty_search(self):
+        link = "https://www.youtube.com/watch?v=YDI3p1hIvdE"
+        self.assertEqual(youtube_query(link), link)
+        process = Mock(returncode=1, communicate=AsyncMock(return_value=(
+            b"", b"ERROR: Sign in to confirm your age https://example.org/?secret=123")))
+        with patch("music.COOKIE_FILE", new=Mock(is_file=lambda: False)), patch(
+                "music.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=process):
+            with self.assertLogs("music", level="WARNING"), self.assertRaises(commands.CommandError) as caught:
+                await resolve_track(link)
+            self.assertIn("confirm your age", str(caught.exception))
+            self.assertNotIn("secret", str(caught.exception))
+            process.returncode = 0
+            with self.assertRaisesRegex(commands.CommandError, "No YouTube video matched"):
+                await resolve_track("ytsearch1:song")
+
+    async def test_optional_cookie_file(self):
+        process = Mock(returncode=0, communicate=AsyncMock(return_value=(b'{"title":"song","url":"stream"}', b"")))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "yt-cookies.txt"
+            with patch("music.COOKIE_FILE", path), patch("music.asyncio.create_subprocess_exec",
+                    new_callable=AsyncMock, return_value=process) as launch:
+                await resolve_track("ytsearch1:song")
+                self.assertNotIn("--cookies", launch.await_args.args)
+                path.touch()
+                await resolve_track("ytsearch1:song")
+                args = launch.await_args.args
+                self.assertEqual(args[args.index("--cookies") + 1], str(path))
+                process.returncode = 1
+                process.communicate.return_value = (b"", b"ERROR: invalid cookie row containing SECRET")
+                with self.assertRaises(commands.CommandError) as caught:
+                    await resolve_track("ytsearch1:song")
+                self.assertNotIn("SECRET", str(caught.exception))
 
     async def test_role_is_persistent_and_guild_scoped(self):
         with tempfile.TemporaryDirectory() as tmp:

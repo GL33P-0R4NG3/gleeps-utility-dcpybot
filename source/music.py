@@ -1,8 +1,10 @@
 """Single-track YouTube playback with per-server role access."""
 import asyncio
 import json
+import logging
 import re
 import shutil
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import discord
@@ -35,20 +37,39 @@ def youtube_query(text):
     return "https://www.youtube.com/watch?v=" + video
 
 
+COOKIE_FILE = Path(__file__).resolve().parents[2] / "yt-cookies.txt"
+AUDIO_FORMAT = ("bestaudio[protocol=https]/best[protocol=https]/"
+                "bestaudio[protocol^=m3u8]/best[protocol^=m3u8]")
+
+
 async def resolve_track(query):
+    cookie_args = ["--cookies", str(COOKIE_FILE)] if COOKIE_FILE.is_file() else []
     process = await asyncio.create_subprocess_exec(
-        "yt-dlp", "--ignore-config", "--no-playlist", "--no-warnings", "--no-progress",
-        "--encoding", "utf-8", "-f", "bestaudio[protocol=https]/best[protocol=https]",
+        "yt-dlp", "--ignore-config", "--no-playlist", "--no-progress",
+        *cookie_args, "--encoding", "utf-8", "-f", AUDIO_FORMAT,
         "--print", "%(.{title,url})j", "--", query,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
-        output, _ = await asyncio.wait_for(process.communicate(), 45)
+        output, diagnostics = await asyncio.wait_for(process.communicate(), 45)
     finally:
         if process.returncode is None:
             process.kill()
             await process.wait()
-    if process.returncode or not output.strip():
-        raise commands.CommandError("YouTube returned no playable track. Try another name or video.")
+    if process.returncode:
+        if cookie_args:
+            # Cookie parser errors can quote malformed rows, including session values.
+            if b"confirm" in diagnostics.lower() and b"bot" in diagnostics.lower():
+                raise commands.CommandError("YouTube still requires verification with the configured cookies.")
+            raise commands.CommandError("Authenticated YouTube lookup failed. Check the cookie file and video on the server.")
+        lines = diagnostics.decode("utf-8", errors="replace").splitlines()
+        detail = next((line for line in reversed(lines) if line.startswith("ERROR:")),
+                      next(iter(reversed(lines)), "No diagnostic was returned."))
+        # Media URLs can contain signed parameters; keep them out of replies and logs.
+        detail = re.sub(r"https?://\S+", "[link]", detail)[:500]
+        logging.getLogger(__name__).warning("YouTube lookup failed (exit %s): %s", process.returncode, detail)
+        raise commands.CommandError(f"YouTube lookup failed. {discord.utils.escape_markdown(detail)}")
+    if not output.strip():
+        raise commands.CommandError("No YouTube video matched that search.")
     track = json.loads(output)
     return track["title"], track["url"]
 
@@ -101,7 +122,8 @@ class Music(commands.Cog):
         try:
             title, url = await resolve_track(target)
         except (TimeoutError, commands.CommandError) as error:
-            await ctx.reply(str(error) or "YouTube took too long to respond. Try again.")
+            await ctx.reply(str(error) or "YouTube took too long to respond. Try again.",
+                            allowed_mentions=discord.AllowedMentions.none())
             return
         if not ctx.author.voice or ctx.author.voice.channel != channel:
             await ctx.reply("You left the voice channel before playback started.")
