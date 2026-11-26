@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 import shutil
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -47,7 +48,7 @@ async def resolve_track(query):
     process = await asyncio.create_subprocess_exec(
         "yt-dlp", "--ignore-config", "--no-playlist", "--no-progress",
         *cookie_args, "--encoding", "utf-8", "-f", AUDIO_FORMAT,
-        "--print", "%(.{title,url})j", "--", query,
+        "--print", "%(.{title,url,http_headers,format_id,acodec,protocol})j", "--", query,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         output, diagnostics = await asyncio.wait_for(process.communicate(), 45)
@@ -71,7 +72,38 @@ async def resolve_track(query):
     if not output.strip():
         raise commands.CommandError("No YouTube video matched that search.")
     track = json.loads(output)
-    return track["title"], track["url"]
+    logging.getLogger(__name__).info("Selected YouTube audio format=%s codec=%s protocol=%s",
+                                     track.get("format_id"), track.get("acodec"), track.get("protocol"))
+    return track["title"], track["url"], track.get("http_headers") or {}
+
+
+class MusicAudio(discord.FFmpegOpusAudio):
+    """Buffer the first audio packet before announcing playback."""
+    first_packet = b""
+
+    def prime(self):
+        packet = super().read()
+        while packet.startswith((b"OpusHead", b"OpusTags")):
+            packet = super().read()
+        self.first_packet = packet
+        return bool(packet)
+
+    def read(self):
+        if self.first_packet:
+            packet, self.first_packet = self.first_packet, b""
+            return packet
+        return super().read()
+
+
+def audio_input_options(headers):
+    options = ["-nostdin", "-rw_timeout", "15000000"]
+    # Pass only playback headers; never forward account cookies to redirects.
+    fields = [f"{key}: {value}\r\n" for key, value in headers.items()
+              if key.lower() in {"user-agent", "referer", "origin", "accept", "accept-language"}
+              and isinstance(value, str) and "\r" not in value and "\n" not in value]
+    if fields:
+        options.extend(["-headers", "".join(fields)])
+    return shlex.join(options)
 
 
 class Music(commands.Cog):
@@ -120,7 +152,7 @@ class Music(commands.Cog):
             await ctx.reply("The server needs FFmpeg and yt-dlp installed for music playback.")
             return
         try:
-            title, url = await resolve_track(target)
+            title, url, headers = await resolve_track(target)
         except (TimeoutError, commands.CommandError) as error:
             await ctx.reply(str(error) or "YouTube took too long to respond. Try again.",
                             allowed_mentions=discord.AllowedMentions.none())
@@ -137,10 +169,18 @@ class Music(commands.Cog):
                 finished.set_result(error)
 
         try:
-            source = discord.FFmpegOpusAudio(url, before_options="-nostdin -rw_timeout 15000000", options="-vn")
+            source = MusicAudio(url, before_options=audio_input_options(headers), options="-map 0:a:0 -vn")
             try:
+                if not await asyncio.wait_for(asyncio.to_thread(source.prime), 25):
+                    source.cleanup()
+                    await ctx.reply("FFmpeg received no playable audio from YouTube.")
+                    return
                 voice.play(source, after=lambda error: loop.call_soon_threadsafe(finish, error))
-            except Exception:
+            except (TimeoutError, discord.ClientException):
+                source.cleanup()
+                await ctx.reply("I found the video, but could not start its audio stream.")
+                return
+            except BaseException:
                 source.cleanup()
                 raise
             await ctx.reply(f"Playing **{discord.utils.escape_markdown(title)}** in {channel.mention}.",

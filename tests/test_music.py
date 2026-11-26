@@ -81,8 +81,8 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
         voice.is_playing.return_value = voice.is_paused.return_value = False
         voice.play.side_effect = lambda source, after: after(None)
         with patch("music.shutil.which", return_value="tool"), patch("music.resolve_track",
-                new_callable=AsyncMock, return_value=("Song", "https://example.org/audio")) as lookup, patch(
-                "music.discord.FFmpegOpusAudio"):
+                new_callable=AsyncMock, return_value=("Song", "https://example.org/audio", {})) as lookup, patch(
+                "music.MusicAudio"):
             await Music.play.callback(Music(), ctx, query="song")
             lookup.assert_not_awaited()
             ctx.author.roles = [Mock(id=42)]
