@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 import re
-import shlex
+import subprocess
 import shutil
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -43,12 +43,16 @@ AUDIO_FORMAT = ("bestaudio[protocol=https]/best[protocol=https]/"
                 "bestaudio[protocol^=m3u8]/best[protocol^=m3u8]")
 
 
+def cookie_options():
+    return ["--cookies", str(COOKIE_FILE)] if COOKIE_FILE.is_file() else []
+
+
 async def resolve_track(query):
-    cookie_args = ["--cookies", str(COOKIE_FILE)] if COOKIE_FILE.is_file() else []
+    cookie_args = cookie_options()
     process = await asyncio.create_subprocess_exec(
         "yt-dlp", "--ignore-config", "--no-playlist", "--no-progress",
         *cookie_args, "--encoding", "utf-8", "-f", AUDIO_FORMAT,
-        "--print", "%(.{title,url,http_headers,format_id,acodec,protocol})j", "--", query,
+        "--check-formats", "--print", "%(.{title,id,format_id,acodec,protocol})j", "--", query,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         output, diagnostics = await asyncio.wait_for(process.communicate(), 45)
@@ -57,6 +61,8 @@ async def resolve_track(query):
             process.kill()
             await process.wait()
     if process.returncode:
+        if b"403" in diagnostics and b"forbidden" in diagnostics.lower():
+            raise commands.CommandError("YouTube refused the media request (HTTP 403).")
         if cookie_args:
             # Cookie parser errors can quote malformed rows, including session values.
             if b"confirm" in diagnostics.lower() and b"bot" in diagnostics.lower():
@@ -74,7 +80,7 @@ async def resolve_track(query):
     track = json.loads(output)
     logging.getLogger(__name__).info("Selected YouTube audio format=%s codec=%s protocol=%s",
                                      track.get("format_id"), track.get("acodec"), track.get("protocol"))
-    return track["title"], track["url"], track.get("http_headers") or {}
+    return track["title"], track["id"], track["format_id"]
 
 
 class MusicAudio(discord.FFmpegOpusAudio):
@@ -95,15 +101,13 @@ class MusicAudio(discord.FFmpegOpusAudio):
         return super().read()
 
 
-def audio_input_options(headers):
-    options = ["-nostdin", "-rw_timeout", "15000000"]
-    # Pass only playback headers; never forward account cookies to redirects.
-    fields = [f"{key}: {value}\r\n" for key, value in headers.items()
-              if key.lower() in {"user-agent", "referer", "origin", "accept", "accept-language"}
-              and isinstance(value, str) and "\r" not in value and "\n" not in value]
-    if fields:
-        options.extend(["-headers", "".join(fields)])
-    return shlex.join(options)
+def stream_track(video_id, format_id):
+    # Let the extractor handle authenticated HTTP requests. FFmpeg receives media bytes.
+    return subprocess.Popen(
+        ["yt-dlp", "--ignore-config", "--no-playlist", "--quiet", "--no-progress",
+         *cookie_options(), "--downloader", "native", "-f", format_id, "-o", "-", "--",
+         f"https://www.youtube.com/watch?v={video_id}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
 class Music(commands.Cog):
@@ -152,7 +156,7 @@ class Music(commands.Cog):
             await ctx.reply("The server needs FFmpeg and yt-dlp installed for music playback.")
             return
         try:
-            title, url, headers = await resolve_track(target)
+            title, video_id, format_id = await resolve_track(target)
         except (TimeoutError, commands.CommandError) as error:
             await ctx.reply(str(error) or "YouTube took too long to respond. Try again.",
                             allowed_mentions=discord.AllowedMentions.none())
@@ -168,8 +172,10 @@ class Music(commands.Cog):
             if not finished.done():
                 finished.set_result(error)
 
+        download = None
         try:
-            source = MusicAudio(url, before_options=audio_input_options(headers), options="-map 0:a:0 -vn")
+            download = stream_track(video_id, format_id)
+            source = MusicAudio(download.stdout, pipe=True, options="-map 0:a:0 -vn")
             try:
                 if not await asyncio.wait_for(asyncio.to_thread(source.prime), 25):
                     source.cleanup()
@@ -185,8 +191,13 @@ class Music(commands.Cog):
                 raise
             await ctx.reply(f"Playing **{discord.utils.escape_markdown(title)}** in {channel.mention}.",
                             allowed_mentions=discord.AllowedMentions.none())
-            if await finished:
+            if await finished or download.poll() not in (None, 0):
                 await ctx.channel.send("Playback ended early because the audio stream failed.")
         finally:
+            if download is not None:
+                if download.poll() is None:
+                    download.kill()
+                await asyncio.to_thread(download.wait)
+                download.stdout.close()
             if ctx.guild.voice_client is voice and voice.is_connected():
                 await voice.disconnect(force=True)

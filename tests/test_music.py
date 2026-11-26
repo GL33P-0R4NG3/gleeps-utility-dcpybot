@@ -37,7 +37,7 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
                 await resolve_track("ytsearch1:song")
 
     async def test_optional_cookie_file(self):
-        process = Mock(returncode=0, communicate=AsyncMock(return_value=(b'{"title":"song","url":"stream"}', b"")))
+        process = Mock(returncode=0, communicate=AsyncMock(return_value=(b'{"title":"song","id":"YDI3p1hIvdE","format_id":"251"}', b"")))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "yt-cookies.txt"
             with patch("music.COOKIE_FILE", path), patch("music.asyncio.create_subprocess_exec",
@@ -81,8 +81,9 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
         voice.is_playing.return_value = voice.is_paused.return_value = False
         voice.play.side_effect = lambda source, after: after(None)
         with patch("music.shutil.which", return_value="tool"), patch("music.resolve_track",
-                new_callable=AsyncMock, return_value=("Song", "https://example.org/audio", {})) as lookup, patch(
-                "music.MusicAudio"):
+                new_callable=AsyncMock, return_value=("Song", "YDI3p1hIvdE", "251")) as lookup, patch(
+                "music.MusicAudio") as audio, patch("music.stream_track") as stream:
+            stream.return_value.poll.return_value = 0
             await Music.play.callback(Music(), ctx, query="song")
             lookup.assert_not_awaited()
             ctx.author.roles = [Mock(id=42)]
@@ -92,6 +93,9 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
             ctx.guild.voice_client = None
             channel.connect = AsyncMock(return_value=voice)
             await asyncio.wait_for(Music.play.callback(Music(), ctx, query="song"), 2)
+            stream.assert_called_once_with("YDI3p1hIvdE", "251")
+            audio.assert_called_once_with(stream.return_value.stdout, pipe=True, options="-map 0:a:0 -vn")
+            stream.return_value.stdout.close.assert_called_once()
             voice.play.assert_called_once()
             self.assertEqual(ctx.bot.voice_activity, {})
 
