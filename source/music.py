@@ -86,6 +86,7 @@ async def resolve_track(query):
 class MusicAudio(discord.FFmpegOpusAudio):
     """Buffer the first audio packet before announcing playback."""
     first_packet = b""
+    frames_read = 0
 
     def prime(self):
         packet = super().read()
@@ -97,8 +98,11 @@ class MusicAudio(discord.FFmpegOpusAudio):
     def read(self):
         if self.first_packet:
             packet, self.first_packet = self.first_packet, b""
-            return packet
-        return super().read()
+        else:
+            packet = super().read()
+        if packet:
+            self.frames_read += 1
+        return packet
 
 
 def stream_track(video_id, format_id):
@@ -108,6 +112,15 @@ def stream_track(video_id, format_id):
          *cookie_options(), "--downloader", "native", "-f", format_id, "-o", "-", "--",
          f"https://www.youtube.com/watch?v={video_id}"],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def log_voice_state(phase, voice, source):
+    # discord.py 2.7 exposes DAVE readiness on its connection, not on VoiceClient.
+    connection = getattr(voice, "_connection", None)
+    logging.getLogger(__name__).info(
+        "Voice playback %s guild=%s frames_read=%s transport=%s dave_version=%s dave_ready=%s",
+        phase, voice.guild.id, source.frames_read, voice.mode,
+        getattr(connection, "dave_protocol_version", None), getattr(connection, "can_encrypt", None))
 
 
 class Music(commands.Cog):
@@ -181,6 +194,7 @@ class Music(commands.Cog):
                     source.cleanup()
                     await ctx.reply("FFmpeg received no playable audio from YouTube.")
                     return
+                log_voice_state("start", voice, source)
                 voice.play(source, after=lambda error: loop.call_soon_threadsafe(finish, error))
             except (TimeoutError, discord.ClientException):
                 source.cleanup()
@@ -191,7 +205,9 @@ class Music(commands.Cog):
                 raise
             await ctx.reply(f"Playing **{discord.utils.escape_markdown(title)}** in {channel.mention}.",
                             allowed_mentions=discord.AllowedMentions.none())
-            if await finished or download.poll() not in (None, 0):
+            error = await finished
+            log_voice_state("end", voice, source)
+            if error or download.poll() not in (None, 0):
                 await ctx.channel.send("Playback ended early because the audio stream failed.")
         finally:
             if download is not None:
