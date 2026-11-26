@@ -19,21 +19,20 @@ class IdleVoice(commands.Cog):
         if channel is None:
             await ctx.reply("Join a voice channel first.")
             return
-        voice = ctx.guild.voice_client
-        if voice and voice.channel == channel:
-            await ctx.reply("I'm already in your voice channel.")
+        if ctx.guild.voice_client is not None or ctx.guild.id in ctx.bot.voice_activity:
+            await ctx.reply("I already have a voice session in this server.")
             return
         if not channel.permissions_for(ctx.guild.me).connect:
             await ctx.reply("I need Connect permission in your voice channel.")
             return
+        ctx.bot.voice_activity[ctx.guild.id] = "joining"
         try:
-            if voice:
-                await voice.move_to(channel)
-            else:
-                await channel.connect(reconnect=False, self_mute=True, self_deaf=True)
+            await channel.connect(reconnect=False, self_mute=True, self_deaf=True)
         except (TimeoutError, discord.DiscordException):
             await ctx.reply("I couldn't join your voice channel. You can try again.")
             return
+        finally:
+            ctx.bot.voice_activity.pop(ctx.guild.id, None)
         await ctx.reply(f"I'm idling in {channel.mention}.")
 
     @afk.command()
@@ -41,6 +40,9 @@ class IdleVoice(commands.Cog):
     @commands.is_owner()
     async def leave(self, ctx):
         """End my idle voice session in this server."""
+        if ctx.guild.id in ctx.bot.voice_activity:
+            await ctx.reply("There is no idle AFK session to end right now.")
+            return
         voice = ctx.guild.voice_client
         if voice is None:
             await ctx.reply("I'm already out of voice.")

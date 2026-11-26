@@ -13,6 +13,7 @@ from room_help import RoomHelpView
 from lobby_access import apply_lobby_gate
 from room_ringing import RoomRinging
 from idle_voice import IdleVoice
+from music import Music
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ class UtilityBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="g!", intents=intents)
         self.db = db if db is not None else DBHelper()
+        self.voice_activity: dict[int, str] = {}
         self.before_invoke(self.defer_slash_response)
 
     async def defer_slash_response(self, ctx):
@@ -40,6 +42,7 @@ class UtilityBot(commands.Bot):
         await self.add_cog(RoomCommands(self))
         await self.add_cog(SQLConsole(self))
         await self.add_cog(IdleVoice())
+        await self.add_cog(Music())
         self.add_command(set_lobby.copy())
         synced = await self.tree.sync()
         log.info("Slash commands registered count=%s", len(synced))
@@ -52,6 +55,8 @@ class UtilityBot(commands.Bot):
             return
         if isinstance(error, commands.NotOwner):
             await ctx.reply("Only the bot owner can use this command.")
+        elif isinstance(error, commands.MaxConcurrencyReached) and ctx.command.name == "play":
+            await ctx.reply("A track is already loading or playing in this server.")
         elif isinstance(error, commands.UserInputError):
             await ctx.reply(f"{error}\nUse `g!help {ctx.command.qualified_name}` for command syntax.",
                             allowed_mentions=discord.AllowedMentions.none())

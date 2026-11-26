@@ -160,6 +160,15 @@ class DBHelper:
                 await db.commit()
                 return normalize_settings({})
 
+    async def set_play_role(self, guild_id: int, role_id: Optional[int]) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                """INSERT INTO guilds (guild_id, settings_json) VALUES (?, json_object('PlayRoleID', ?))
+                   ON CONFLICT(guild_id) DO UPDATE SET
+                   settings_json = json_set(guilds.settings_json, '$.PlayRoleID', ?)""",
+                (guild_id, role_id, role_id))
+            await db.commit()
+
     async def set_settings_guild(self, guild_id: int, settings: Dict[str, Any]) -> None:
         """
         Replace the whole ``settings_json`` for a guild with the supplied dict.
