@@ -8,6 +8,7 @@ __pycache__/
 
 # Custom
 *.db
+yt-cookies.txt
 
 # Distribution / packaging
 .Python
