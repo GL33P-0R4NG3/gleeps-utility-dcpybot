@@ -6,7 +6,8 @@ import re
 import subprocess
 import shutil
 from dataclasses import dataclass, field
-from weakref import WeakValueDictionary
+from weakref import WeakValueDictionary, WeakSet
+from music_queue_view import QueueView
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -138,12 +139,14 @@ def log_voice_state(phase, voice, source):
 
 
 IDLE_TIMEOUT = 3600
+QUEUE_LIMIT = 1000
 
 
 @dataclass
 class Request:
     query: str
     chat: discord.abc.Messageable
+    id: int = 0
 
     async def report(self, message):
         try:
@@ -192,12 +195,41 @@ async def prepare_track(request):
 @dataclass
 class Session:
     voice: discord.VoiceClient
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    pending: dict[int, Request] = field(default_factory=dict)
+    last_id: int = 0
+    current: Track | None = None
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+    views: WeakSet = field(default_factory=WeakSet)
     worker: asyncio.Task | None = None
     closing: bool = False
     playing: bool = False
     waiting: bool = False
     idle_timer: asyncio.TimerHandle | None = None
+
+    def notify(self):
+        self.changed.set()
+        self.changed = asyncio.Event()
+        for view in list(self.views):
+            view.refresh()
+
+    def enqueue(self, request):
+        if len(self.pending) >= QUEUE_LIMIT:
+            return False
+        self.cancel_idle()
+        self.last_id += 1
+        request.id = self.last_id
+        self.pending[request.id] = request
+        self.notify()
+        return True
+
+    def remove(self, ids):
+        removed = 0
+        for entry_id in ids:
+            if self.pending.pop(entry_id, None) is not None:
+                removed += 1
+        if removed:
+            self.notify()
+        return removed
 
     def cancel_idle(self):
         if self.idle_timer:
@@ -206,7 +238,7 @@ class Session:
 
     def check_idle(self):
         self.cancel_idle()
-        if self.waiting and not self.playing and self.queue.empty():
+        if self.waiting and not self.playing and not self.pending:
             self.idle_timer = asyncio.get_running_loop().call_later(IDLE_TIMEOUT, self.expire)
 
     def expire(self):
@@ -216,16 +248,29 @@ class Session:
 
 async def next_track(session):
     while True:
-        session.waiting = True
-        session.check_idle()
-        request = await session.queue.get()
+        while not session.pending:
+            session.waiting = True
+            session.check_idle()
+            await session.changed.wait()
+        request = next(iter(session.pending.values()))
         session.waiting = False
         session.cancel_idle()
         try:
-            return await prepare_track(request)
+            track = await prepare_track(request)
         except Exception as exc:
-            detail = str(exc) if isinstance(exc, commands.CommandError) else "Could not load the audio."
-            await request.report(f"Skipping **{discord.utils.escape_markdown(request.query)}**. {detail}")
+            if session.remove([request.id]):
+                detail = str(exc) if isinstance(exc, commands.CommandError) else "Could not load the audio."
+                await request.report(f"Skipping **{discord.utils.escape_markdown(request.query)}**. {detail}")
+            continue
+        try:
+            while session.playing and request.id in session.pending:
+                await session.changed.wait()
+            if request.id in session.pending:
+                return track
+        except BaseException:
+            await asyncio.to_thread(track.close)
+            raise
+        await asyncio.to_thread(track.close)
 
 
 class Music(commands.Cog):
@@ -289,9 +334,12 @@ class Music(commands.Cog):
                     raise
                 session = self.sessions[guild_id] = Session(voice)
                 session.worker = asyncio.create_task(self.run_session(ctx.bot, guild_id, session))
-            session.cancel_idle()
-            session.queue.put_nowait(Request(query, ctx.channel))
-        await ctx.reply("Added to the music queue.")
+            request = Request(query, ctx.channel)
+            if not session.enqueue(request):
+                await ctx.reply("This server has 1,000 tracks waiting. Please wait for a spot to open.")
+                return
+            position = len(session.pending)
+        await ctx.reply(f"Added to the music queue at position #{position}.")
 
     async def run_session(self, bot, guild_id, session):
         voice = session.voice
@@ -302,7 +350,11 @@ class Music(commands.Cog):
                 track = await upcoming
                 upcoming = None
                 try:
-                    if not await wait_for_voice_encryption(voice):
+                    ready = await wait_for_voice_encryption(voice)
+                    if track.request.id not in session.pending:
+                        upcoming = asyncio.create_task(next_track(session))
+                        continue
+                    if not ready:
                         log_voice_state("encryption-unavailable", voice, track.source)
                         await track.request.report("Voice encryption is unavailable. Ending this music session.")
                         break
@@ -313,6 +365,8 @@ class Music(commands.Cog):
                     log_voice_state("start", voice, track.source)
                     voice.play(track.source, after=lambda error, callback=finish: loop.call_soon_threadsafe(callback, error))
                     track.playing = session.playing = True
+                    session.current = track
+                    session.remove([track.request.id])
                     upcoming = asyncio.create_task(next_track(session))
                     await track.request.report(f"Playing **{discord.utils.escape_markdown(track.title)}** in {voice.channel.mention}.")
                     error = await finished
@@ -325,12 +379,17 @@ class Music(commands.Cog):
                     if track.playing and (not finished.done() or finished.cancelled()):
                         voice.stop()
                     session.playing = False
+                    session.current = None
+                    session.remove([track.request.id])
+                    session.notify()
                     await asyncio.to_thread(track.close)
                     session.check_idle()
                 if upcoming is None:
                     upcoming = asyncio.create_task(next_track(session))
         finally:
             session.closing = True
+            session.pending.clear()
+            session.notify()
             session.cancel_idle()
             try:
                 if upcoming is not None:
@@ -343,6 +402,62 @@ class Music(commands.Cog):
             finally:
                 self.sessions.pop(guild_id, None)
                 bot.voice_activity.pop(guild_id, None)
+
+    @commands.hybrid_group(name="queue", invoke_without_command=True)
+    @discord.app_commands.guild_only()
+    @commands.guild_only()
+    async def queue_group(self, ctx):
+        """View and manage the music queue."""
+        await ctx.reply("Use /queue list or /queue clear.")
+
+    @queue_group.command(name="list")
+    @commands.guild_only()
+    async def queue_list(self, ctx, page: int = 1):
+        """Show what's playing and browse the live waiting list."""
+        session = self.sessions.get(ctx.guild.id)
+        if not session or session.closing:
+            await ctx.reply("There is no music session in this server.")
+            return
+        if not ctx.author.guild_permissions.administrator and (
+                not ctx.author.voice or ctx.author.voice.channel != session.voice.channel):
+            await ctx.reply("Join my music channel to view its queue.")
+            return
+        view = QueueView(session, page, ctx.author.id)
+        session.views.add(view)
+        view.message = await ctx.reply(embed=view.render(), view=view, ephemeral=True)
+        view.refresh()  # Include changes made while Discord was sending the reply.
+
+    @queue_group.command(name="clear")
+    @commands.guild_only()
+    async def queue_clear(self, ctx, *, positions: str):
+        """Remove waiting songs by their current positions, or enter all."""
+        if not await self.allowed(ctx):
+            await ctx.reply("You need the music role or Administrator permission to clear tracks.")
+            return
+        session = self.sessions.get(ctx.guild.id)
+        if not session or session.closing:
+            await ctx.reply("There is no music session in this server.")
+            return
+        if not ctx.author.guild_permissions.administrator and (
+                not ctx.author.voice or ctx.author.voice.channel != session.voice.channel):
+            await ctx.reply("Join my music channel first.")
+            return
+        if positions.strip().lower() == "all":
+            selected = list(session.pending)
+        else:
+            parts = [part.strip().removeprefix("#") for part in positions.split(",")]
+            if not all(re.fullmatch(r"[1-9][0-9]{0,15}", part) for part in parts):
+                await ctx.reply("Enter all or comma-separated queue positions, for example 20,50,56.")
+                return
+            selected = set(map(int, parts))
+            # Map every position before removing anything; lower positions may shift.
+            snapshot = list(session.pending)
+            if any(position > len(snapshot) for position in selected):
+                await ctx.reply("A position is outside the current queue. Nothing was removed. Check /queue list.")
+                return
+            selected = [snapshot[position - 1] for position in selected]
+        removed = session.remove(selected)
+        await ctx.reply(f"Removed {removed} waiting " + ("track." if removed == 1 else "tracks."))
 
     async def stop_session(self, session):
         if not session.closing:

@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands
 from data.db_helper import DBHelper
 from idle_voice import IdleVoice
+from music_queue_view import QueueView
 from music import Music, Request, Session, Track, resolve_track, youtube_query, wait_for_voice_encryption
 
 
@@ -123,6 +124,68 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
             await cog.leave.callback(cog, ctx)
             self.assertEqual(ctx.bot.voice_activity, {})
 
+    async def test_limit_and_live_positions(self):
+        cog = Music()
+        ctx = Mock(reply=AsyncMock())
+        ctx.author.guild_permissions.administrator = True
+        session = cog.sessions[ctx.guild.id] = Session(Mock())
+        for n in range(1000):
+            self.assertTrue(session.enqueue(Request(f"song {n + 1}", ctx.channel)))
+        self.assertFalse(session.enqueue(Request("overflow", ctx.channel)))
+        session.remove([1])  # Former #2 becomes #1.
+        self.assertTrue(session.enqueue(Request("tail", ctx.channel)))
+        await cog.queue_clear.callback(cog, ctx, positions="1,3,3")
+        self.assertEqual([r.query for r in list(session.pending.values())[:2]], ["song 3", "song 5"])
+        await cog.queue_clear.callback(cog, ctx, positions="1,1000")
+        self.assertEqual(len(session.pending), 998)
+        view = QueueView(session, 1, 1)
+        self.assertIn("**#1** \u00b7 song 3", view.render().fields[1].value)
+        view.page = 100
+        self.assertIn("tail", view.render().fields[-1].value)
+        await cog.queue_clear.callback(cog, ctx, positions="all")
+        self.assertEqual(len(session.pending), 0)
+        self.assertIn("Page 1/1", view.render().footer.text)
+        view.stop()
+
+    async def test_live_list_edits_existing_message_when_first_track_starts(self):
+        session = Session(Mock())
+        first = Request("one", Mock())
+        session.enqueue(first)
+        session.enqueue(Request("two", Mock()))
+        view = QueueView(session, 1, 42)
+        session.views.add(view)
+        view.message = Mock(edit=AsyncMock())
+        session.current = Track(first, "Resolved song title", Mock(), Mock())
+        session.remove([first.id])
+        await asyncio.wait_for(view.update, 3)
+        embed = view.message.edit.await_args.kwargs["embed"]
+        self.assertEqual(embed.fields[0].value, "Resolved song title")
+        self.assertIn("**#1** \u00b7 two", embed.fields[1].value)
+        view.stop()
+
+    async def test_removing_prefetched_track_prepares_next_while_song_plays(self):
+        from music import next_track
+        session = Session(Mock(), playing=True)
+        chat = Mock()
+        requests = [Request(name, chat) for name in ("removed", "kept")]
+        for request in requests:
+            session.enqueue(request)
+        prepared = asyncio.Queue()
+        async def prepare(request):
+            track = Mock(request=request)
+            prepared.put_nowait(track)
+            return track
+        with patch("music.prepare_track", side_effect=prepare):
+            task = asyncio.create_task(next_track(session))
+            first = await asyncio.wait_for(prepared.get(), 1)
+            session.remove([requests[0].id])
+            second = await asyncio.wait_for(prepared.get(), 1)
+            first.close.assert_called_once()
+            self.assertFalse(task.done())
+            session.playing = False
+            session.notify()
+            self.assertIs(await asyncio.wait_for(task, 1), second)
+
     async def test_fifo_prefetch_failure_and_idle_disconnect(self):
         cog = Music()
         voice = Mock(disconnect=AsyncMock())
@@ -133,7 +196,7 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
         chat = Mock(send=AsyncMock())
         requests = [Request(name, chat) for name in ("first", "bad", "second", "third")]
         for request in requests:
-            session.queue.put_nowait(request)
+            session.enqueue(request)
         tracks = {r.query: Track(r, r.query, Mock(), Mock()) for r in requests}
         for track in tracks.values():
             track.download.poll.return_value = 0
