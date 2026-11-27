@@ -304,6 +304,8 @@ class Session:
 async def next_track(session):
     while True:
         while not session.pending:
+            if not session.playing:
+                session.cancel_pause_timer()
             session.waiting = True
             session.check_idle()
             await session.changed.wait()
@@ -417,12 +419,18 @@ class Music(commands.Cog):
                     def finish(error, future=finished):
                         if not future.done():
                             future.set_result(error)
-                    log_voice_state("start", voice, track.source)
-                    voice.play(track.source, after=lambda error, callback=finish: loop.call_soon_threadsafe(callback, error))
-                    track.playing = session.playing = True
+                    session.playing = True
                     session.current = track
                     session.remove([track.request.id])
                     upcoming = asyncio.create_task(next_track(session))
+                    # A skipped-to song stays at its first packet until explicitly resumed.
+                    while session.pause_timer and not track.skipped:
+                        await session.changed.wait()
+                    if track.skipped:
+                        continue
+                    log_voice_state("start", voice, track.source)
+                    voice.play(track.source, after=lambda error, callback=finish: loop.call_soon_threadsafe(callback, error))
+                    track.playing = True
                     await track.request.report(f"Playing **{discord.utils.escape_markdown(track.title)}** in {voice.channel.mention}.")
                     error = await finished
                     log_voice_state("end", voice, track.source)
@@ -433,7 +441,8 @@ class Music(commands.Cog):
                 finally:
                     if track.playing and (not finished.done() or finished.cancelled()):
                         voice.stop()
-                    session.cancel_pause_timer()
+                    if not track.skipped or not session.pending:
+                        session.cancel_pause_timer()
                     session.playing = False
                     session.current = None
                     session.remove([track.request.id])
@@ -444,6 +453,7 @@ class Music(commands.Cog):
                     upcoming = asyncio.create_task(next_track(session))
         finally:
             session.closing = True
+            session.cancel_pause_timer()
             session.pending.clear()
             session.notify()
             session.cancel_idle()
@@ -481,7 +491,7 @@ class Music(commands.Cog):
         session = await self.playback_session(ctx)
         if session is None:
             return
-        if session.voice.is_paused():
+        if session.pause_timer or session.voice.is_paused():
             await ctx.reply("Already paused. Use /resume to continue.")
         elif session.voice.is_playing():
             session.voice.pause()
@@ -499,10 +509,11 @@ class Music(commands.Cog):
         session = await self.playback_session(ctx)
         if session is None:
             return
-        if not session.voice.is_paused():
+        if not session.pause_timer and not session.voice.is_paused():
             await ctx.reply("Playback isn't paused.")
             return
-        session.voice.resume()
+        if session.voice.is_paused():
+            session.voice.resume()
         session.cancel_pause_timer()
         session.notify()
         await ctx.reply("Playback resumed.")
@@ -515,16 +526,25 @@ class Music(commands.Cog):
         session = await self.playback_session(ctx)
         if session is None:
             return
-        if not (session.voice.is_playing() or session.voice.is_paused()):
+        track = session.current
+        held = bool(session.pause_timer and not track.playing)
+        if track.skipped or not (held or session.voice.is_playing() or session.voice.is_paused()):
             await ctx.reply("The song is already ending.")
             return
-        session.cancel_pause_timer()
-        track = session.current
         track.skipped = True
         has_next = bool(session.pending)
-        session.voice.stop()  # The normal playback callback advances the FIFO queue.
-        await asyncio.to_thread(track.source.cleanup)  # Wake a player blocked on a stalled stream.
-        await ctx.reply("Skipped the current song." if has_next else "Playback stopped. The queue is empty.")
+        keep_paused = bool(session.pause_timer and has_next)
+        if not keep_paused:
+            session.cancel_pause_timer()
+        if held:
+            session.notify()
+        else:
+            session.voice.stop()
+            await asyncio.to_thread(track.source.cleanup)
+        if keep_paused:
+            await ctx.reply("Skipped. The next song will wait at the beginning until /resume.")
+        else:
+            await ctx.reply("Skipped the current song." if has_next else "Playback stopped. The queue is empty.")
 
     @commands.hybrid_group(name="queue", invoke_without_command=True)
     @discord.app_commands.guild_only()

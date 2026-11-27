@@ -221,7 +221,7 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
     async def test_pause_resume_and_skip_keep_queue(self):
         cog = Music()
         voice = Mock()
-        session = Session(voice, current=Mock(), playing=True)
+        session = Session(voice, current=Mock(skipped=False, playing=True), playing=True)
         ctx = Mock(reply=AsyncMock())
         ctx.author.guild_permissions.administrator = False
         cog.allowed = AsyncMock(return_value=True)
@@ -243,6 +243,45 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
         await cog.skip.callback(cog, ctx)
         voice.stop.assert_called_once()
         self.assertEqual([r.query for r in session.pending.values()], ["waiting"])
+
+    async def test_paused_skips_hold_following_tracks_before_first_frame(self):
+        cog = Music()
+        voice = Mock(disconnect=AsyncMock())
+        voice.guild.voice_client = voice
+        voice.is_paused.return_value = False
+        callbacks = asyncio.Queue()
+        voice.play.side_effect = lambda source, after: callbacks.put_nowait(after)
+        ctx = Mock(reply=AsyncMock())
+        ctx.author.guild_permissions.administrator = True
+        session = cog.sessions[ctx.guild.id] = Session(voice)
+        requests = [Request(name, Mock(send=AsyncMock())) for name in ("one", "two", "three")]
+        tracks = [Track(r, r.query, Mock(), Mock()) for r in requests]
+        for r in requests:
+            session.enqueue(r)
+
+        async def wait_current(track):
+            async with asyncio.timeout(2):
+                while session.current is not track:
+                    await asyncio.sleep(0.001)
+
+        with patch("music.prepare_track", new_callable=AsyncMock, side_effect=tracks):
+            session.worker = asyncio.create_task(cog.run_session(ctx.bot, ctx.guild.id, session))
+            try:
+                after = await asyncio.wait_for(callbacks.get(), 2)
+                voice.stop.side_effect = lambda: after(None)
+                await cog.stop.callback(cog, ctx)
+                await cog.skip.callback(cog, ctx)
+                await wait_current(tracks[1])
+                self.assertIsNotNone(session.pause_timer)
+                voice.play.assert_called_once()
+                await cog.skip.callback(cog, ctx)
+                await wait_current(tracks[2])
+                voice.play.assert_called_once()
+                await cog.resume.callback(cog, ctx)
+                await asyncio.wait_for(callbacks.get(), 2)
+                self.assertEqual(voice.play.call_args.args, (tracks[2].source,))
+            finally:
+                await cog.stop_session(session)
 
     async def test_skip_last_track_leaves_session_idle(self):
         cog = Music()
