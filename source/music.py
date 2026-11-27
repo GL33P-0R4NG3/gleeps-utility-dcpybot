@@ -4,6 +4,8 @@ import json
 import logging
 import re
 import subprocess
+import threading
+from collections import deque
 import shutil
 from dataclasses import dataclass, field
 from weakref import WeakValueDictionary, WeakSet
@@ -87,25 +89,71 @@ async def resolve_track(query):
 
 
 class MusicAudio(discord.FFmpegOpusAudio):
-    """Buffer the first audio packet before announcing playback."""
-    first_packet = b""
-    frames_read = 0
+    """Keep up to three seconds of encoded audio ahead of Discord's player."""
+    buffer_frames = 150  # FFmpeg's Opus output uses 20 ms packets.
+
+    def __init__(self, *args, **kwargs):
+        self.frames_read = 0
+        self._packets = deque()
+        self._condition = threading.Condition()
+        self._finished = False
+        self._closed = False
+        self._read_error = None
+        super().__init__(*args, **kwargs)
+        threading.Thread(target=self._fill_buffer, name="music-prebuffer", daemon=True).start()
+
+    def _fill_buffer(self):
+        try:
+            while True:
+                with self._condition:
+                    self._condition.wait_for(lambda: self._closed or len(self._packets) < self.buffer_frames)
+                    if self._closed:
+                        return
+                packet = super().read()
+                if not packet:
+                    return
+                if packet.startswith((b"OpusHead", b"OpusTags")):
+                    continue
+                with self._condition:
+                    if self._closed:
+                        return
+                    self._packets.append(packet)
+                    self._condition.notify_all()
+        except Exception as exc:
+            with self._condition:
+                self._read_error = exc
+        finally:
+            with self._condition:
+                self._finished = True
+                self._condition.notify_all()
 
     def prime(self):
-        packet = super().read()
-        while packet.startswith((b"OpusHead", b"OpusTags")):
-            packet = super().read()
-        self.first_packet = packet
-        return bool(packet)
+        with self._condition:
+            self._condition.wait_for(lambda: self._finished or self._closed or len(self._packets) >= self.buffer_frames)
+            return bool(self._packets) and not self._closed
 
     def read(self):
-        if self.first_packet:
-            packet, self.first_packet = self.first_packet, b""
-        else:
-            packet = super().read()
-        if packet:
+        with self._condition:
+            self._condition.wait_for(lambda: self._packets or self._finished or self._closed)
+            if self._closed:
+                return b""
+            if not self._packets:
+                if self._read_error:
+                    raise self._read_error
+                return b""
+            packet = self._packets.popleft()
             self.frames_read += 1
-        return packet
+            self._condition.notify_all()
+            return packet
+
+    def cleanup(self):
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._packets.clear()
+            self._condition.notify_all()
+        super().cleanup()
 
 
 def stream_track(video_id, format_id):

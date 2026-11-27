@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -15,6 +16,37 @@ from music import Music, Request, Session, Track, resolve_track, youtube_query, 
 
 
 class MusicTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prebuffer_absorbs_stall_and_refills_in_order(self):
+        from music import MusicAudio
+        stalled = threading.Event()
+        resume = threading.Event()
+        packets = iter([b"OpusHead", b"OpusTags", b"a", b"b", b"c", b"d", b"e", b""])
+
+        def read_packet():
+            packet = next(packets)
+            if packet == b"d":
+                stalled.set()
+                if not resume.wait(2):
+                    raise TimeoutError("test producer stalled")
+            return packet
+
+        with patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None), patch.object(
+                discord.FFmpegOpusAudio, "read", side_effect=read_packet) as reader, patch.object(
+                discord.FFmpegOpusAudio, "cleanup"), patch.object(MusicAudio, "buffer_frames", 3):
+            audio = MusicAudio("test")
+            try:
+                self.assertTrue(await asyncio.wait_for(asyncio.to_thread(audio.prime), 2))
+                self.assertEqual(reader.call_count, 5)
+                self.assertEqual(audio.read(), b"a")
+                self.assertTrue(await asyncio.to_thread(stalled.wait, 1))
+                self.assertEqual([audio.read(), audio.read()], [b"b", b"c"])
+                resume.set()
+                self.assertEqual(await asyncio.to_thread(lambda: list(iter(audio.read, b""))), [b"d", b"e"])
+                self.assertEqual(audio.frames_read, 5)
+            finally:
+                resume.set()
+                audio.cleanup()
+
     async def test_voice_encryption_gate(self):
         voice = Mock()
         voice.is_connected.return_value = True
