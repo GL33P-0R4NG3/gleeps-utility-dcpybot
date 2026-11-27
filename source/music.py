@@ -210,6 +210,7 @@ class Track:
     download: subprocess.Popen
     source: MusicAudio
     playing: bool = False
+    skipped: bool = False
 
     def close(self):
         if self.download.poll() is None:
@@ -252,6 +253,7 @@ class Session:
     closing: bool = False
     playing: bool = False
     waiting: bool = False
+    pause_timer: asyncio.TimerHandle | None = None
     idle_timer: asyncio.TimerHandle | None = None
 
     def notify(self):
@@ -278,6 +280,11 @@ class Session:
         if removed:
             self.notify()
         return removed
+
+    def cancel_pause_timer(self):
+        if self.pause_timer:
+            self.pause_timer.cancel()
+            self.pause_timer = None
 
     def cancel_idle(self):
         if self.idle_timer:
@@ -419,13 +426,14 @@ class Music(commands.Cog):
                     await track.request.report(f"Playing **{discord.utils.escape_markdown(track.title)}** in {voice.channel.mention}.")
                     error = await finished
                     log_voice_state("end", voice, track.source)
-                    if error or track.download.poll() not in (None, 0):
+                    if not track.skipped and (error or track.download.poll() not in (None, 0)):
                         await track.request.report(f"Playback failed for **{discord.utils.escape_markdown(track.title)}**. Skipping.")
                 except discord.ClientException:
                     await track.request.report(f"Could not play **{discord.utils.escape_markdown(track.title)}**. Skipping.")
                 finally:
                     if track.playing and (not finished.done() or finished.cancelled()):
                         voice.stop()
+                    session.cancel_pause_timer()
                     session.playing = False
                     session.current = None
                     session.remove([track.request.id])
@@ -450,6 +458,73 @@ class Music(commands.Cog):
             finally:
                 self.sessions.pop(guild_id, None)
                 bot.voice_activity.pop(guild_id, None)
+
+    async def playback_session(self, ctx):
+        if not await self.allowed(ctx):
+            await ctx.reply("You need the music role or Administrator permission to control playback.")
+            return None
+        session = self.sessions.get(ctx.guild.id)
+        if session is None or session.closing or session.current is None:
+            await ctx.reply("There is no current song to control.")
+            return None
+        if not ctx.author.guild_permissions.administrator and (
+                not ctx.author.voice or ctx.author.voice.channel != session.voice.channel):
+            await ctx.reply("Join my music channel first.")
+            return None
+        return session
+
+    @commands.hybrid_command()
+    @discord.app_commands.guild_only()
+    @commands.guild_only()
+    async def stop(self, ctx):
+        """Pause the current song in place. Use /resume to continue."""
+        session = await self.playback_session(ctx)
+        if session is None:
+            return
+        if session.voice.is_paused():
+            await ctx.reply("Already paused. Use /resume to continue.")
+        elif session.voice.is_playing():
+            session.voice.pause()
+            session.pause_timer = asyncio.get_running_loop().call_later(IDLE_TIMEOUT, session.expire)
+            session.notify()
+            await ctx.reply("Paused. Use /resume to continue.")
+        else:
+            await ctx.reply("The song is already ending.")
+
+    @commands.hybrid_command()
+    @discord.app_commands.guild_only()
+    @commands.guild_only()
+    async def resume(self, ctx):
+        """Continue the paused song from the same position."""
+        session = await self.playback_session(ctx)
+        if session is None:
+            return
+        if not session.voice.is_paused():
+            await ctx.reply("Playback isn't paused.")
+            return
+        session.voice.resume()
+        session.cancel_pause_timer()
+        session.notify()
+        await ctx.reply("Playback resumed.")
+
+    @commands.hybrid_command()
+    @discord.app_commands.guild_only()
+    @commands.guild_only()
+    async def skip(self, ctx):
+        """Skip the current song, including a paused song."""
+        session = await self.playback_session(ctx)
+        if session is None:
+            return
+        if not (session.voice.is_playing() or session.voice.is_paused()):
+            await ctx.reply("The song is already ending.")
+            return
+        session.cancel_pause_timer()
+        track = session.current
+        track.skipped = True
+        has_next = bool(session.pending)
+        session.voice.stop()  # The normal playback callback advances the FIFO queue.
+        await asyncio.to_thread(track.source.cleanup)  # Wake a player blocked on a stalled stream.
+        await ctx.reply("Skipped the current song." if has_next else "Playback stopped. The queue is empty.")
 
     @commands.hybrid_group(name="queue", invoke_without_command=True)
     @discord.app_commands.guild_only()

@@ -28,7 +28,7 @@ class QueueView(discord.ui.View):
             embed.description = "Music session ended."
             return embed
         current = session.current
-        embed.add_field(name="Now playing", inline=False,
+        embed.add_field(name="Paused" if session.pause_timer else "Now playing", inline=False,
                         value=discord.utils.escape_markdown(current.title[:300]) if current else "Nothing playing")
         start = (self.page - 1) * self.page_size
         lines = []

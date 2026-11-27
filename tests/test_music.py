@@ -218,6 +218,60 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
             session.notify()
             self.assertIs(await asyncio.wait_for(task, 1), second)
 
+    async def test_pause_resume_and_skip_keep_queue(self):
+        cog = Music()
+        voice = Mock()
+        session = Session(voice, current=Mock(), playing=True)
+        ctx = Mock(reply=AsyncMock())
+        ctx.author.guild_permissions.administrator = False
+        cog.allowed = AsyncMock(return_value=True)
+        cog.sessions[ctx.guild.id] = session
+        await cog.stop.callback(cog, ctx)
+        voice.pause.assert_not_called()
+        ctx.author.voice.channel = voice.channel
+        voice.is_paused.return_value = False
+        voice.is_playing.return_value = True
+        session.enqueue(Request("waiting", ctx.channel))
+        await cog.stop.callback(cog, ctx)
+        voice.pause.assert_called_once()
+        timer = session.pause_timer
+        voice.is_paused.return_value = True
+        await cog.resume.callback(cog, ctx)
+        voice.resume.assert_called_once()
+        self.assertTrue(timer.cancelled())
+        voice.is_playing.return_value = False
+        await cog.skip.callback(cog, ctx)
+        voice.stop.assert_called_once()
+        self.assertEqual([r.query for r in session.pending.values()], ["waiting"])
+
+    async def test_skip_last_track_leaves_session_idle(self):
+        cog = Music()
+        voice = Mock(disconnect=AsyncMock())
+        voice.guild.voice_client = voice
+        callbacks = asyncio.Queue()
+        voice.play.side_effect = lambda source, after: callbacks.put_nowait(after)
+        ctx = Mock(reply=AsyncMock())
+        ctx.author.guild_permissions.administrator = True
+        session = cog.sessions[ctx.guild.id] = Session(voice)
+        request = Request("only song", Mock(send=AsyncMock()))
+        track = Track(request, "Only song", Mock(), Mock())
+        track.download.poll.return_value = 0
+        session.enqueue(request)
+        with patch("music.prepare_track", new_callable=AsyncMock, return_value=track):
+            session.worker = asyncio.create_task(cog.run_session(ctx.bot, ctx.guild.id, session))
+            after = await asyncio.wait_for(callbacks.get(), 1)
+            voice.stop.side_effect = lambda: after(None)
+            await cog.skip.callback(cog, ctx)
+            for _ in range(100):
+                if session.idle_timer:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIsNone(session.current)
+            self.assertIsNotNone(session.idle_timer)
+            voice.disconnect.assert_not_awaited()
+            ctx.reply.assert_awaited_with("Playback stopped. The queue is empty.")
+            await cog.stop_session(session)
+
     async def test_fifo_prefetch_failure_and_idle_disconnect(self):
         cog = Music()
         voice = Mock(disconnect=AsyncMock())
