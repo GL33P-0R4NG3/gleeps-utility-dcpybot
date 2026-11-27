@@ -55,8 +55,6 @@ class UtilityBot(commands.Bot):
             return
         if isinstance(error, commands.NotOwner):
             await ctx.reply("Only the bot owner can use this command.")
-        elif isinstance(error, commands.MaxConcurrencyReached) and ctx.command.name == "play":
-            await ctx.reply("A track is already loading or playing in this server.")
         elif isinstance(error, commands.UserInputError):
             await ctx.reply(f"{error}\nUse `g!help {ctx.command.qualified_name}` for command syntax.",
                             allowed_mentions=discord.AllowedMentions.none())

@@ -10,7 +10,7 @@ import discord
 from discord.ext import commands
 from data.db_helper import DBHelper
 from idle_voice import IdleVoice
-from music import Music, resolve_track, youtube_query, wait_for_voice_encryption
+from music import Music, Request, Session, Track, resolve_track, youtube_query, wait_for_voice_encryption
 
 
 class MusicTests(unittest.IsolatedAsyncioTestCase):
@@ -107,12 +107,63 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
             voice.play.assert_not_called()
             ctx.guild.voice_client = None
             channel.connect = AsyncMock(return_value=voice)
-            await asyncio.wait_for(Music.play.callback(Music(), ctx, query="song"), 2)
+            cog = Music()
+            voice.guild = ctx.guild
+            ctx.channel.send = AsyncMock()
+            await Music.play.callback(cog, ctx, query="song")
+            for _ in range(100):
+                if stream.return_value.stdout.close.called:
+                    break
+                await asyncio.sleep(0.01)
             stream.assert_called_once_with("YDI3p1hIvdE", "251")
             audio.assert_called_once_with(stream.return_value.stdout, pipe=True, options="-map 0:a:0 -vn")
             stream.return_value.stdout.close.assert_called_once()
             voice.play.assert_called_once()
+            self.assertIn(ctx.guild.id, cog.sessions)
+            await cog.leave.callback(cog, ctx)
             self.assertEqual(ctx.bot.voice_activity, {})
+
+    async def test_fifo_prefetch_failure_and_idle_disconnect(self):
+        cog = Music()
+        voice = Mock(disconnect=AsyncMock())
+        voice.guild.voice_client = voice
+        session = Session(voice)
+        cog.sessions[1] = session
+        bot = Mock(voice_activity={1: "music"})
+        chat = Mock(send=AsyncMock())
+        requests = [Request(name, chat) for name in ("first", "bad", "second", "third")]
+        for request in requests:
+            session.queue.put_nowait(request)
+        tracks = {r.query: Track(r, r.query, Mock(), Mock()) for r in requests}
+        for track in tracks.values():
+            track.download.poll.return_value = 0
+        prefetched = asyncio.Event()
+        prepared = []
+        callbacks = asyncio.Queue()
+        async def prepare(request):
+            prepared.append(request.query)
+            if request.query == "bad":
+                raise commands.CommandError("No song found.")
+            if request.query == "second":
+                prefetched.set()
+            return tracks[request.query]
+        voice.play.side_effect = lambda source, after: callbacks.put_nowait(after)
+        with patch("music.prepare_track", side_effect=prepare), patch("music.IDLE_TIMEOUT", 0.05):
+            session.worker = asyncio.create_task(cog.run_session(bot, 1, session))
+            first_finished = await asyncio.wait_for(callbacks.get(), 1)
+            await asyncio.wait_for(prefetched.wait(), 1)
+            self.assertEqual(prepared, ["first", "bad", "second"])
+            self.assertTrue(any("Skipping **bad**" in call.args[0] for call in chat.send.await_args_list))
+            first_finished(None)
+            for _ in range(2):
+                callback = await asyncio.wait_for(callbacks.get(), 1)
+                callback(None)
+            await asyncio.wait_for(asyncio.gather(session.worker, return_exceptions=True), 2)
+        self.assertEqual([call.args[0] for call in voice.play.call_args_list],
+                         [tracks[name].source for name in ("first", "second", "third")])
+        voice.disconnect.assert_awaited_once_with(force=True)
+        self.assertFalse(cog.sessions)
+        self.assertFalse(bot.voice_activity)
 
     async def test_afk_cannot_take_over_connected_or_loading_session(self):
         ctx = Mock(reply=AsyncMock())

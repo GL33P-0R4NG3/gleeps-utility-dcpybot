@@ -1,10 +1,12 @@
-"""Single-track YouTube playback with per-server role access."""
+"""Queued YouTube playback with per-server role access."""
 import asyncio
 import json
 import logging
 import re
 import subprocess
 import shutil
+from dataclasses import dataclass, field
+from weakref import WeakValueDictionary
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -135,7 +137,108 @@ def log_voice_state(phase, voice, source):
         getattr(connection, "dave_protocol_version", None), getattr(connection, "can_encrypt", None))
 
 
+IDLE_TIMEOUT = 3600
+
+
+@dataclass
+class Request:
+    query: str
+    chat: discord.abc.Messageable
+
+    async def report(self, message):
+        try:
+            await self.chat.send(message, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            logging.getLogger(__name__).warning("Could not post music status in the request channel")
+
+
+@dataclass
+class Track:
+    request: Request
+    title: str
+    download: subprocess.Popen
+    source: MusicAudio
+    playing: bool = False
+
+    def close(self):
+        if self.download.poll() is None:
+            self.download.kill()
+        self.download.wait()
+        if not self.playing:  # The voice player owns source cleanup after play().
+            self.source.cleanup()
+        self.download.stdout.close()
+
+
+async def prepare_track(request):
+    title, video_id, format_id = await resolve_track(youtube_query(request.query))
+    download = stream_track(video_id, format_id)
+    try:
+        source = MusicAudio(download.stdout, pipe=True, options="-map 0:a:0 -vn")
+    except BaseException:
+        download.kill()
+        download.wait()
+        download.stdout.close()
+        raise
+    track = Track(request, title, download, source)
+    try:
+        if not await asyncio.wait_for(asyncio.to_thread(source.prime), 25):
+            raise commands.CommandError("YouTube returned no playable audio.")
+        return track
+    except BaseException:
+        await asyncio.to_thread(track.close)
+        raise
+
+
+@dataclass
+class Session:
+    voice: discord.VoiceClient
+    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    worker: asyncio.Task | None = None
+    closing: bool = False
+    playing: bool = False
+    waiting: bool = False
+    idle_timer: asyncio.TimerHandle | None = None
+
+    def cancel_idle(self):
+        if self.idle_timer:
+            self.idle_timer.cancel()
+            self.idle_timer = None
+
+    def check_idle(self):
+        self.cancel_idle()
+        if self.waiting and not self.playing and self.queue.empty():
+            self.idle_timer = asyncio.get_running_loop().call_later(IDLE_TIMEOUT, self.expire)
+
+    def expire(self):
+        self.closing = True
+        self.worker.cancel()
+
+
+async def next_track(session):
+    while True:
+        session.waiting = True
+        session.check_idle()
+        request = await session.queue.get()
+        session.waiting = False
+        session.cancel_idle()
+        try:
+            return await prepare_track(request)
+        except Exception as exc:
+            detail = str(exc) if isinstance(exc, commands.CommandError) else "Could not load the audio."
+            await request.report(f"Skipping **{discord.utils.escape_markdown(request.query)}**. {detail}")
+
+
 class Music(commands.Cog):
+    def __init__(self):
+        self.sessions = {}
+        self.locks = WeakValueDictionary()
+
+    async def allowed(self, ctx):
+        if ctx.author.guild_permissions.administrator:
+            return True
+        settings = await ctx.bot.db.get_settings_guild(ctx.guild.id)
+        return any(role.id == settings.get("PlayRoleID") for role in ctx.author.roles)
+
     @commands.hybrid_command()
     @discord.app_commands.guild_only()
     @discord.app_commands.default_permissions(administrator=True)
@@ -150,87 +253,129 @@ class Music(commands.Cog):
     @commands.hybrid_command()
     @discord.app_commands.guild_only()
     @commands.guild_only()
-    @commands.max_concurrency(1, per=commands.BucketType.guild)
     async def play(self, ctx, *, query: str):
-        """Play one YouTube video by link or song name in your voice channel."""
-        settings = await ctx.bot.db.get_settings_guild(ctx.guild.id)
-        if not ctx.author.guild_permissions.administrator and not any(
-                role.id == settings.get("PlayRoleID") for role in ctx.author.roles):
+        """Queue a YouTube link or song name in your voice channel."""
+        if not await self.allowed(ctx):
             await ctx.reply("You need this server's music role or Administrator permission to play music.")
             return
-        channel = ctx.author.voice.channel if ctx.author.voice else None
-        if not isinstance(channel, discord.VoiceChannel):
-            await ctx.reply("Join a voice channel first.")
-            return
-        if ctx.guild.voice_client is not None or ctx.guild.id in ctx.bot.voice_activity:
-            await ctx.reply("I already have a voice session in this server. End it before starting music.")
-            return
-        ctx.bot.voice_activity[ctx.guild.id] = "music"
-        try:
-            await self.play_track(ctx, channel, query)
-        finally:
-            ctx.bot.voice_activity.pop(ctx.guild.id, None)
-
-    async def play_track(self, ctx, channel, query):
-        perms = channel.permissions_for(ctx.guild.me)
-        if not (perms.connect and perms.speak):
-            await ctx.reply("I need Connect and Speak in your voice channel.")
-            return
-        target = youtube_query(query)
-        if any(shutil.which(tool) is None for tool in ("ffmpeg", "yt-dlp")):
-            await ctx.reply("The server needs FFmpeg and yt-dlp installed for music playback.")
-            return
-        try:
-            title, video_id, format_id = await resolve_track(target)
-        except (TimeoutError, commands.CommandError) as error:
-            await ctx.reply(str(error) or "YouTube took too long to respond. Try again.",
-                            allowed_mentions=discord.AllowedMentions.none())
-            return
-        if not ctx.author.voice or ctx.author.voice.channel != channel:
-            await ctx.reply("You left the voice channel before playback started.")
-            return
-        voice = await channel.connect(self_deaf=True, reconnect=False)
-        loop = asyncio.get_running_loop()
-        finished = loop.create_future()
-
-        def finish(error):
-            if not finished.done():
-                finished.set_result(error)
-
-        download = None
-        try:
-            download = stream_track(video_id, format_id)
-            source = MusicAudio(download.stdout, pipe=True, options="-map 0:a:0 -vn")
-            try:
-                if not await asyncio.wait_for(asyncio.to_thread(source.prime), 25):
-                    source.cleanup()
-                    await ctx.reply("FFmpeg received no playable audio from YouTube.")
-                    return
-                if not await wait_for_voice_encryption(voice):
-                    log_voice_state("encryption-unavailable", voice, source)
-                    source.cleanup()
-                    await ctx.reply("The voice session did not become ready for playback. Please try again.")
-                    return
-                log_voice_state("start", voice, source)
-                voice.play(source, after=lambda error: loop.call_soon_threadsafe(finish, error))
-            except (TimeoutError, discord.ClientException):
-                source.cleanup()
-                await ctx.reply("I found the video, but could not start its audio stream.")
+        youtube_query(query)  # Validate locally; only the worker contacts YouTube.
+        guild_id = ctx.guild.id
+        async with self.locks.setdefault(guild_id, asyncio.Lock()):
+            channel = ctx.author.voice.channel if ctx.author.voice else None
+            if not isinstance(channel, discord.VoiceChannel):
+                await ctx.reply("Join a voice channel first.")
                 return
-            except BaseException:
-                source.cleanup()
-                raise
-            await ctx.reply(f"Playing **{discord.utils.escape_markdown(title)}** in {channel.mention}.",
-                            allowed_mentions=discord.AllowedMentions.none())
-            error = await finished
-            log_voice_state("end", voice, source)
-            if error or download.poll() not in (None, 0):
-                await ctx.channel.send("Playback ended early because the audio stream failed.")
+            session = self.sessions.get(guild_id)
+            if session:
+                if session.closing or session.voice.channel != channel or not session.voice.is_connected():
+                    await ctx.reply("Join my active music channel, or try again after I disconnect.")
+                    return
+            else:
+                if ctx.guild.voice_client is not None or guild_id in ctx.bot.voice_activity:
+                    await ctx.reply("I already have a voice session in this server.")
+                    return
+                perms = channel.permissions_for(ctx.guild.me)
+                if not (perms.connect and perms.speak):
+                    await ctx.reply("I need Connect and Speak in your voice channel.")
+                    return
+                if any(shutil.which(tool) is None for tool in ("ffmpeg", "yt-dlp")):
+                    await ctx.reply("The server needs FFmpeg and yt-dlp installed for music playback.")
+                    return
+                ctx.bot.voice_activity[guild_id] = "music"
+                try:
+                    voice = await channel.connect(self_deaf=True, reconnect=False)
+                except BaseException:
+                    ctx.bot.voice_activity.pop(guild_id, None)
+                    raise
+                session = self.sessions[guild_id] = Session(voice)
+                session.worker = asyncio.create_task(self.run_session(ctx.bot, guild_id, session))
+            session.cancel_idle()
+            session.queue.put_nowait(Request(query, ctx.channel))
+        await ctx.reply("Added to the music queue.")
+
+    async def run_session(self, bot, guild_id, session):
+        voice = session.voice
+        loop = asyncio.get_running_loop()
+        upcoming = asyncio.create_task(next_track(session))
+        try:
+            while True:
+                track = await upcoming
+                upcoming = None
+                try:
+                    if not await wait_for_voice_encryption(voice):
+                        log_voice_state("encryption-unavailable", voice, track.source)
+                        await track.request.report("Voice encryption is unavailable. Ending this music session.")
+                        break
+                    finished = loop.create_future()
+                    def finish(error, future=finished):
+                        if not future.done():
+                            future.set_result(error)
+                    log_voice_state("start", voice, track.source)
+                    voice.play(track.source, after=lambda error, callback=finish: loop.call_soon_threadsafe(callback, error))
+                    track.playing = session.playing = True
+                    upcoming = asyncio.create_task(next_track(session))
+                    await track.request.report(f"Playing **{discord.utils.escape_markdown(track.title)}** in {voice.channel.mention}.")
+                    error = await finished
+                    log_voice_state("end", voice, track.source)
+                    if error or track.download.poll() not in (None, 0):
+                        await track.request.report(f"Playback failed for **{discord.utils.escape_markdown(track.title)}**. Skipping.")
+                except discord.ClientException:
+                    await track.request.report(f"Could not play **{discord.utils.escape_markdown(track.title)}**. Skipping.")
+                finally:
+                    if track.playing and (not finished.done() or finished.cancelled()):
+                        voice.stop()
+                    session.playing = False
+                    await asyncio.to_thread(track.close)
+                    session.check_idle()
+                if upcoming is None:
+                    upcoming = asyncio.create_task(next_track(session))
         finally:
-            if download is not None:
-                if download.poll() is None:
-                    download.kill()
-                await asyncio.to_thread(download.wait)
-                download.stdout.close()
-            if ctx.guild.voice_client is voice and voice.is_connected():
-                await voice.disconnect(force=True)
+            session.closing = True
+            session.cancel_idle()
+            try:
+                if upcoming is not None:
+                    upcoming.cancel()
+                    result, = await asyncio.gather(upcoming, return_exceptions=True)
+                    if isinstance(result, Track):
+                        await asyncio.to_thread(result.close)
+                if voice.guild.voice_client is voice:
+                    await voice.disconnect(force=True)
+            finally:
+                self.sessions.pop(guild_id, None)
+                bot.voice_activity.pop(guild_id, None)
+
+    async def stop_session(self, session):
+        if not session.closing:
+            session.closing = True
+            await asyncio.sleep(0)  # Let a newly scheduled worker enter its cleanup block.
+            session.worker.cancel()
+        await asyncio.gather(session.worker, return_exceptions=True)
+
+    @commands.hybrid_command()
+    @discord.app_commands.guild_only()
+    @commands.guild_only()
+    async def leave(self, ctx):
+        """End the music session and clear its queue."""
+        if not await self.allowed(ctx):
+            await ctx.reply("You need this server's music role or Administrator permission to end music.")
+            return
+        session = self.sessions.get(ctx.guild.id)
+        if session is None:
+            await ctx.reply("There is no music session to end.")
+            return
+        if not ctx.author.guild_permissions.administrator and (
+                not ctx.author.voice or ctx.author.voice.channel != session.voice.channel):
+            await ctx.reply("Join my music channel first.")
+            return
+        await self.stop_session(session)
+        await ctx.reply("Music disconnected and the queue was cleared.")
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        session = self.sessions.get(member.guild.id)
+        if session and member.id == member.guild.me.id and before.channel and after.channel is None:
+            if not session.closing:
+                await self.stop_session(session)
+
+    async def cog_unload(self):
+        await asyncio.gather(*(self.stop_session(session) for session in list(self.sessions.values())))
